@@ -429,3 +429,352 @@ end
 - **A/B 测试分析**：理解不同模型的差异
 - **用户反馈处理**：解释为什么某个结果排名靠前
 - **模型诊断**：发现特征工程的问题
+
+## 6.3 查询优化器的设计原理
+
+查询优化器负责将逻辑查询计划转换为高效的物理执行计划。在分布式搜索系统中，优化器需要考虑数据分布、网络开销、缓存命中率等多种因素，选择最优的执行策略。
+
+### 查询计划的代价模型
+
+准确的代价估算是查询优化的基础。我们需要建立一个综合考虑 CPU、内存、网络和 I/O 的代价模型：
+
+```ocaml
+module type COST_MODEL = sig
+  type cost = {
+    cpu_cycles: int64;
+    memory_bytes: int64;
+    network_bytes: int64;
+    disk_ios: int;
+    estimated_time_ms: float;
+  }
+  
+  type statistics = {
+    index_size: int64;
+    posting_list_length: int;
+    term_selectivity: float;
+    cache_hit_rate: float;
+    node_latency_ms: float;
+  }
+  
+  (* 基础操作的代价估算 *)
+  val scan_cost : statistics -> string -> cost
+  val merge_cost : int list -> cost  (* 合并多个posting list *)
+  val sort_cost : int -> cost  (* 排序 n 个文档 *)
+  val network_transfer : int -> float -> cost  (* bytes, bandwidth *)
+  
+  (* 组合操作的代价 *)
+  val combine_costs : cost list -> cost
+  val scale_cost : cost -> float -> cost
+  
+  (* 代价比较 *)
+  val compare : cost -> cost -> int
+  val to_comparable_score : cost -> float
+end
+
+(* 查询操作符的代价估算 *)
+module type OPERATOR_COST = sig
+  type operator =
+    | TermScan of string * field
+    | PhraseMatch of string list * int  (* terms, slop *)
+    | BooleanAnd of operator list
+    | BooleanOr of operator list
+    | Filter of operator * predicate
+    | Sort of operator * sort_spec
+    | TopK of operator * int
+  
+  val estimate_cost : operator -> statistics -> cost
+  val estimate_cardinality : operator -> statistics -> int
+  
+  (* 选择性估算 *)
+  val estimate_selectivity : operator -> float
+  val combine_selectivities : combinator -> float list -> float
+end
+```
+
+代价模型的关键考虑：
+- **统计信息准确性**：过期的统计信息导致错误的优化决策
+- **相关性假设**：词项间的独立性假设可能不成立
+- **缓存效应**：热点数据的缓存显著影响实际代价
+- **并行度影响**：并行执行时的资源竞争
+
+### 基于规则的优化策略
+
+查询优化器通过一系列转换规则来改进查询计划：
+
+```ocaml
+module type QUERY_REWRITER = sig
+  type rewrite_rule = query_plan -> query_plan option
+  
+  (* 常见的重写规则 *)
+  val push_down_filters : rewrite_rule
+  val merge_adjacent_filters : rewrite_rule
+  val eliminate_redundant_sorts : rewrite_rule
+  val constant_folding : rewrite_rule
+  val common_subexpression_elimination : rewrite_rule
+  
+  (* 布尔查询优化 *)
+  val cnf_conversion : rewrite_rule  (* 转换为合取范式 *)
+  val dnf_conversion : rewrite_rule  (* 转换为析取范式 *)
+  val boolean_simplification : rewrite_rule
+  val short_circuit_evaluation : rewrite_rule
+  
+  (* 组合规则 *)
+  val compose : rewrite_rule list -> rewrite_rule
+  val fixpoint : rewrite_rule -> rewrite_rule  (* 反复应用直到不变 *)
+  
+  (* 规则应用策略 *)
+  type strategy = 
+    | TopDown
+    | BottomUp
+    | Hybrid of (query_plan -> strategy)
+  
+  val apply_rules : strategy -> rewrite_rule list -> query_plan -> query_plan
+end
+
+(* 具体的优化规则实现 *)
+module QueryOptimizations = struct
+  (* 谓词下推：将过滤条件推到数据源附近 *)
+  let push_down_filters plan =
+    match plan with
+    | Join (Filter (left, pred1), right) 
+      when involves_only pred1 (schema_of left) ->
+        Some (Filter (Join (left, right), pred1))
+    | _ -> None
+    
+  (* 合并相邻过滤器 *)
+  let merge_adjacent_filters plan =
+    match plan with
+    | Filter (Filter (child, pred1), pred2) ->
+        Some (Filter (child, And [pred1; pred2]))
+    | _ -> None
+    
+  (* 利用索引的查询改写 *)
+  let use_index_for_sort plan =
+    match plan with
+    | Sort (TermScan (term, field), order) 
+      when has_sorted_index field order ->
+        Some (IndexScan (term, field, order))
+    | _ -> None
+end
+```
+
+优化规则的设计原则：
+- **保证等价性**：转换前后的语义必须相同
+- **单调改进**：每个规则都应该降低代价
+- **局部性**：规则应该易于实现和验证
+- **可组合性**：多个规则可以安全地组合使用
+
+### 自适应查询执行
+
+静态优化可能因为统计信息不准确而失效。自适应执行在运行时动态调整执行策略：
+
+```ocaml
+module type ADAPTIVE_EXECUTOR = sig
+  type execution_state
+  type feedback = {
+    actual_cardinality: int;
+    actual_cost: cost;
+    memory_usage: int64;
+    time_elapsed: float;
+  }
+  
+  (* 执行计划的动态调整 *)
+  val create_adaptive_plan : query_plan -> adaptive_plan
+  val execute_with_feedback : adaptive_plan -> execution_state
+  
+  (* 运行时统计收集 *)
+  val collect_statistics : execution_state -> feedback
+  val update_estimates : feedback -> statistics -> statistics
+  
+  (* 重新优化决策点 *)
+  type reopt_point = {
+    condition: feedback -> bool;
+    alternative_plans: query_plan list;
+  }
+  
+  val add_reopt_point : adaptive_plan -> reopt_point -> adaptive_plan
+  
+  (* 常见的自适应策略 *)
+  val adaptive_join_order : join_plan -> adaptive_plan
+  val adaptive_parallelism : int -> adaptive_plan -> adaptive_plan
+  val adaptive_memory_allocation : memory_budget -> adaptive_plan
+end
+
+(* 具体的自适应策略 *)
+module AdaptiveStrategies = struct
+  (* 动态调整并行度 *)
+  let adaptive_parallelism initial_threads plan =
+    let adjust_threads feedback current_threads =
+      let cpu_utilization = feedback.actual_cost.cpu_cycles /. 
+                           (feedback.time_elapsed *. float_of_int current_threads) in
+      if cpu_utilization < 0.5 then
+        max 1 (current_threads / 2)  (* 降低并行度 *)
+      else if cpu_utilization > 0.9 && current_threads < max_threads then
+        min max_threads (current_threads * 2)  (* 增加并行度 *)
+      else
+        current_threads
+    in
+    create_adaptive plan initial_threads adjust_threads
+    
+  (* 动态选择 join 算法 *)
+  let adaptive_join left right =
+    let choose_algorithm stats =
+      let left_size = estimate_cardinality left stats in
+      let right_size = estimate_cardinality right stats in
+      let memory_available = get_available_memory () in
+      
+      if min left_size right_size * 8 < memory_available then
+        HashJoin (left, right)
+      else if is_sorted left && is_sorted right then
+        MergeJoin (left, right)
+      else
+        NestedLoopJoin (left, right)
+    in
+    create_adaptive_join initial_stats choose_algorithm
+end
+```
+
+自适应执行的权衡：
+- **开销 vs 收益**：监控和重优化本身有成本
+- **稳定性**：避免执行计划频繁变化
+- **可预测性**：用户期望相似查询有相似性能
+- **资源限制**：内存和 CPU 的动态分配需要全局协调
+
+### 分布式查询的优化考虑
+
+在分布式环境中，查询优化需要考虑额外的维度：
+
+```ocaml
+module type DISTRIBUTED_OPTIMIZER = sig
+  type node_id = string
+  type shard_info = {
+    node: node_id;
+    shard_id: int;
+    doc_count: int;
+    size_bytes: int64;
+    replicas: node_id list;
+  }
+  
+  type network_topology = {
+    latency_matrix: (node_id * node_id * float) list;
+    bandwidth_matrix: (node_id * node_id * float) list;
+    node_capacity: (node_id * resource_limits) list;
+  }
+  
+  (* 分布式执行计划 *)
+  type distributed_plan =
+    | Local of node_id * query_plan
+    | Scatter of query_plan * shard_info list
+    | Gather of distributed_plan list * merge_function
+    | Exchange of distributed_plan * partitioner
+  
+  (* 优化目标 *)
+  type optimization_goal =
+    | MinimizeLatency
+    | MinimizeBandwidth
+    | MaximizeThroughput
+    | BalanceLoad
+  
+  val optimize : query_plan -> network_topology -> optimization_goal -> distributed_plan
+  
+  (* 数据局部性优化 *)
+  val maximize_locality : distributed_plan -> distributed_plan
+  val minimize_shuffles : distributed_plan -> distributed_plan
+  
+  (* 负载均衡 *)
+  val balance_shards : shard_info list -> query -> shard_assignment
+  val handle_skew : distributed_plan -> skew_statistics -> distributed_plan
+  
+  (* 容错考虑 *)
+  val add_speculation : distributed_plan -> float -> distributed_plan
+  val select_replicas : shard_info list -> network_topology -> shard_selection
+end
+
+(* 分布式优化策略 *)
+module DistributedStrategies = struct
+  (* 最小化网络传输 *)
+  let minimize_network_transfer plan topology =
+    let rec optimize = function
+      | Join (left, right) as join ->
+          let left_size = estimate_output_size left in
+          let right_size = estimate_output_size right in
+          if left_size < right_size then
+            BroadcastJoin (optimize left, optimize right)
+          else if can_copartition left right then
+            ColocatedJoin (optimize left, optimize right)
+          else
+            ShuffleJoin (optimize left, optimize right)
+      | other -> map_children optimize other
+    in
+    optimize plan
+    
+  (* 查询下推到存储层 *)
+  let push_computation_to_storage plan =
+    let can_push_to_storage = function
+      | Filter _ | Project _ | Limit _ -> true
+      | Aggregate ([], _) -> true  (* 全局聚合可以部分下推 *)
+      | _ -> false
+    in
+    let rec push = function
+      | Scan (table, Filter (pred, Project (fields, rest))) 
+        when can_push_to_storage (Filter (pred, Project (fields, Scan table))) ->
+          StorageScan (table, Some pred, Some fields, push rest)
+      | other -> map_children push other
+    in
+    push plan
+end
+```
+
+分布式优化的关键考虑：
+- **数据本地性**：优先在数据所在节点执行计算
+- **网络开销**：最小化跨节点数据传输
+- **并行机会**：识别可并行执行的子任务
+- **容错能力**：考虑节点故障时的执行策略
+- **动态负载**：处理数据倾斜和热点问题
+
+### 查询计划缓存
+
+频繁执行的查询可以缓存其优化后的执行计划：
+
+```ocaml
+module type PLAN_CACHE = sig
+  type cache_key
+  type cached_plan = {
+    plan: query_plan;
+    statistics: statistics;
+    timestamp: float;
+    hit_count: int;
+    avg_execution_time: float;
+  }
+  
+  (* 缓存管理 *)
+  val get : cache_key -> cached_plan option
+  val put : cache_key -> query_plan -> unit
+  val invalidate : cache_key -> unit
+  val clear : unit -> unit
+  
+  (* 缓存键生成 *)
+  val compute_key : query -> cache_key
+  val normalize_query : query -> query  (* 参数化查询 *)
+  
+  (* 自适应缓存策略 *)
+  val should_cache : query -> execution_feedback -> bool
+  val should_recompile : cached_plan -> current_statistics -> bool
+  
+  (* 缓存统计 *)
+  type cache_stats = {
+    size: int;
+    hit_rate: float;
+    avg_compilation_time: float;
+    avg_compilation_savings: float;
+  }
+  
+  val get_stats : unit -> cache_stats
+end
+```
+
+缓存策略的权衡：
+- **缓存粒度**：整个计划 vs 子计划片段
+- **失效策略**：基于时间、统计变化或显式失效
+- **内存使用**：计划大小与缓存收益的平衡
+- **参数化**：支持相似查询共享计划
