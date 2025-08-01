@@ -14,80 +14,311 @@
 
 ## 14.1 性能工程概述
 
+性能工程是一门系统化的学科，它不仅关注代码层面的优化，更重要的是从架构设计开始就将性能作为一等公民。在搜索引擎这样的大规模分布式系统中，性能问题往往来自于架构设计的不合理，而非单个组件的实现缺陷。本节将建立性能工程的整体框架，为后续的具体优化技术奠定基础。
+
 ### 14.1.1 搜索系统的性能维度
 
-搜索引擎的性能可以从多个维度衡量：
+搜索引擎的性能可以从多个维度衡量，每个维度都有其特定的度量指标和优化方法。理解这些维度之间的相互关系是性能优化的第一步。
 
 ```ocaml
 type performance_metric = 
   | Latency of {
-      p50: float;
-      p90: float;
-      p99: float;
-      p999: float;
+      p50: float;         (* 中位数延迟 *)
+      p90: float;         (* 90分位延迟 *)
+      p99: float;         (* 99分位延迟 *)
+      p999: float;        (* 99.9分位延迟 *)
+      max: float;         (* 最大延迟 *)
     }
   | Throughput of {
       queries_per_second: int;
       documents_per_second: int;
+      index_updates_per_second: int;
     }
   | Resource_utilization of {
       cpu_usage: float;
       memory_usage: float;
       network_bandwidth: float;
       disk_iops: int;
+      gpu_utilization: float option;
     }
   | Scalability of {
       efficiency: float;  (* 0.0 ~ 1.0 *)
       max_nodes: int;
+      scaling_factor: float;  (* 实际加速比 *)
     }
+  | Availability of {
+      uptime_percentage: float;
+      mtbf: duration;  (* 平均故障间隔时间 *)
+      mttr: duration;  (* 平均恢复时间 *)
+    }
+```
+
+**延迟分析的层次结构**：
+
+搜索请求的端到端延迟可以分解为多个组成部分：
+
+1. **网络延迟**（1-10ms）
+   - 客户端到边缘节点
+   - 边缘节点到数据中心
+   - 数据中心内部通信
+
+2. **查询处理延迟**（10-100ms）
+   - 查询解析和分析（1-5ms）
+   - 索引查找（5-50ms）
+   - 结果排序和聚合（5-30ms）
+   - 后处理和格式化（1-10ms）
+
+3. **缓存查找延迟**（0.1-10ms）
+   - L1缓存命中（<1μs）
+   - L2缓存命中（<100μs）
+   - 分布式缓存（1-10ms）
+
+4. **多模态处理延迟**（10-1000ms）
+   - 图像特征提取（50-200ms）
+   - 视频关键帧分析（100-500ms）
+   - 音频指纹计算（20-100ms）
+
+**吞吐量的限制因素**：
+
+系统吞吐量受到多个因素的限制，识别瓶颈是优化的关键：
+
+```ocaml
+type throughput_bottleneck = 
+  | Single_thread_performance   (* 单线程性能限制 *)
+  | Lock_contention            (* 锁竞争 *)
+  | Memory_bandwidth           (* 内存带宽 *)
+  | Network_capacity           (* 网络容量 *)
+  | Disk_io_limit             (* 磁盘IO限制 *)
+  | Backend_service_capacity   (* 后端服务容量 *)
 ```
 
 ### 14.1.2 性能挑战与权衡
 
-现代搜索系统面临的主要性能挑战：
+现代搜索系统面临的性能挑战不仅来自于规模的增长，更来自于用户期望的提升和使用场景的多样化。理解这些挑战背后的本质矛盾，是做出正确架构决策的前提。
 
-1. **实时性要求**：用户期望毫秒级响应，但索引规模达到TB级别
-2. **查询复杂性**：从简单关键词到复杂的多模态查询
-3. **更新频率**：高频内容更新与索引一致性的平衡
-4. **资源限制**：成本约束下的性能最大化
+#### 主要性能挑战
 
-关键权衡包括：
-- **延迟 vs 吞吐量**：批处理提高吞吐但增加延迟
-- **精确性 vs 性能**：近似算法换取更快响应
-- **内存 vs 计算**：缓存空间与重计算的平衡
-- **一致性 vs 可用性**：CAP定理在搜索场景的体现
+1. **实时性要求的演进**
+   - 传统搜索：秒级响应可接受
+   - 现代搜索：100ms以内期望
+   - 搜索建议：20ms以内实时反馈
+   - 未来趋势：会话式搜索需要流式响应
+
+2. **查询复杂性的增长**
+   ```ocaml
+   type query_complexity = 
+     | Simple_keyword           (* 简单关键词 *)
+     | Boolean_expression      (* 布尔表达式 *)
+     | Faceted_search         (* 分面搜索 *)
+     | Semantic_search        (* 语义搜索 *)
+     | Multimodal_query      (* 多模态查询 *)
+     | Conversational_search  (* 对话式搜索 *)
+   ```
+
+3. **数据更新频率的提升**
+   - 新闻资讯：分钟级更新
+   - 社交内容：秒级更新
+   - 实时数据：毫秒级更新
+   - 流式处理：连续更新
+
+4. **资源限制与成本优化**
+   - 硬件成本：CPU、内存、存储的采购成本
+   - 运营成本：电力、冷却、维护
+   - 云服务成本：按需付费vs预留实例
+   - 碳排放：绿色计算的要求
+
+#### 核心性能权衡
+
+性能优化往往需要在多个目标之间做出权衡，理解这些权衡的本质有助于做出明智的决策：
+
+1. **延迟 vs 吞吐量**
+   ```ocaml
+   type latency_throughput_tradeoff = {
+     batching_size: int;        (* 批处理大小 *)
+     pipeline_depth: int;       (* 流水线深度 *)
+     concurrency_level: int;    (* 并发度 *)
+     scheduling_policy: scheduling_algorithm;
+   }
+   ```
+   - 批处理提高吞吐但增加单个请求延迟
+   - 流水线增加吞吐但增加复杂性
+   - 高并发可能导致资源竞争
+
+2. **精确性 vs 性能**
+   - Top-K近似：只返回最相关的K个结果
+   - 采样技术：在数据子集上计算
+   - 近似算法：LSH、MinHash等
+   - 提前终止：达到质量阈值即停止
+
+3. **内存 vs 计算**
+   - 预计算：空间换时间
+   - 压缩索引：时间换空间
+   - 缓存策略：热数据常驻内存
+   - 动态索引：按需构建
+
+4. **一致性 vs 可用性**
+   - 强一致性：所有副本同步更新
+   - 最终一致性：异步复制
+   - 读己之写：会话一致性
+   - 版本化：多版本并发控制
+
+5. **通用性 vs 专用优化**
+   - 通用索引：支持各种查询类型
+   - 专用索引：针对特定查询模式优化
+   - 混合策略：多种索引结构并存
 
 ### 14.1.3 性能优化方法论
 
-系统化的性能优化流程：
+系统化的性能优化需要遵循科学的方法论，避免盲目优化和过早优化。本节介绍经过实践验证的性能优化流程和原则。
+
+#### 性能优化流程
 
 ```ocaml
 module type PERFORMANCE_OPTIMIZATION = sig
   type bottleneck = 
-    | CPU_bound
-    | Memory_bound
-    | IO_bound
-    | Network_bound
-    | Lock_contention
+    | CPU_bound of {
+        hot_functions: (string * float) list;
+        vectorization_opportunities: int;
+      }
+    | Memory_bound of {
+        cache_misses: int;
+        allocation_rate: float;
+        gc_pressure: float;
+      }
+    | IO_bound of {
+        disk_wait_time: float;
+        network_wait_time: float;
+        blocking_operations: int;
+      }
+    | Lock_contention of {
+        contested_locks: (string * float) list;
+        wait_time_percentage: float;
+      }
 
-  val profile : system -> bottleneck list
-  val optimize : bottleneck -> optimization_strategy
-  val measure : optimization_strategy -> performance_delta
-  val iterate : until_satisfactory -> unit
+  (* 性能剖析 *)
+  val profile : 
+    system -> 
+    workload -> 
+    profiling_config -> 
+    bottleneck list
+
+  (* 优化策略生成 *)
+  val generate_strategies : 
+    bottleneck -> 
+    context -> 
+    optimization_strategy list
+
+  (* 策略评估 *)
+  val evaluate : 
+    strategy:optimization_strategy -> 
+    baseline:performance_metrics -> 
+    performance_delta
+
+  (* 迭代优化 *)
+  val optimize_iteratively : 
+    target:performance_target -> 
+    max_iterations:int -> 
+    optimization_result
 end
 ```
 
-优化原则：
-1. **测量先行**：没有测量就没有优化
-2. **帕累托原则**：80%的性能问题来自20%的代码
-3. **系统思维**：局部优化可能导致全局退化
-4. **持续迭代**：性能优化是持续过程，不是一次性任务
+#### 优化原则与最佳实践
+
+1. **测量驱动的优化**
+   - 建立性能基准（Baseline）
+   - 使用生产环境数据
+   - 考虑统计显著性
+   - 避免微基准测试陷阱
+
+2. **帕累托原则应用**
+   ```ocaml
+   type pareto_analysis = {
+     hot_paths: (code_path * cpu_percentage) list;
+     memory_hotspots: (allocation_site * bytes) list;
+     io_patterns: (operation * frequency) list;
+   }
+   ```
+   - 识别热点路径
+   - 优先优化高影响代码
+   - 考虑优化的投入产出比
+
+3. **系统思维**
+   - 全局视角：避免局部优化导致全局退化
+   - 端到端分析：从用户请求到响应
+   - 考虑级联效应：一个组件的优化对其他组件的影响
+   - 资源平衡：CPU、内存、IO的均衡利用
+
+4. **持续优化流程**
+   - 性能回归测试
+   - 自动化性能报告
+   - 版本间性能对比
+   - 生产环境监控
+
+#### 性能优化的层次
+
+性能优化可以在多个层次进行，从高到低分别是：
+
+1. **架构层优化**
+   - 服务拆分与合并
+   - 数据分片策略
+   - 缓存架构设计
+   - 异步处理模式
+
+2. **算法层优化**
+   - 时间复杂度降低
+   - 空间复杂度优化
+   - 并行算法设计
+   - 近似算法应用
+
+3. **数据结构优化**
+   - 缓存友好的布局
+   - 紧凑的数据表示
+   - 无锁数据结构
+   - 特化的索引结构
+
+4. **代码层优化**
+   - 循环优化
+   - 向量化（SIMD）
+   - 分支预测优化
+   - 内存访问模式
+
+5. **系统层优化**
+   - 内核参数调优
+   - NUMA亲和性
+   - 中断处理优化
+   - 网络栈优化
+
+#### 性能优化的反模式
+
+避免常见的性能优化陷阱：
+
+1. **过早优化**
+   - 在没有性能数据支持的情况下优化
+   - 优化非关键路径
+   - 牺牲可读性换取微小性能提升
+
+2. **过度优化**
+   - 优化已经足够快的代码
+   - 使用过于复杂的优化技术
+   - 忽视维护成本
+
+3. **错误的优化目标**
+   - 优化错误的指标
+   - 忽视用户体验
+   - 只关注平均值忽视长尾
+
+4. **缺乏全局视角**
+   - 只优化单个组件
+   - 忽视系统间交互
+   - 不考虑扩展性
 
 ## 14.2 缓存层次的设计策略
 
+缓存是提升搜索系统性能的关键技术之一。通过将频繁访问的数据保存在快速存储介质中，可以显著降低查询延迟并减轻后端系统压力。然而，设计一个高效的缓存系统并非简单的"存储热数据"，而需要考虑缓存层次、一致性、淘汰策略等多个维度。本节将深入探讨如何构建一个高效、可扩展的多级缓存架构。
+
 ### 14.2.1 多级缓存架构
 
-现代搜索系统通常采用多级缓存架构：
+现代搜索系统采用多级缓存架构来平衡访问速度、容量和成本。每一级缓存都有其特定的设计目标和优化策略。
 
 ```ocaml
 module type CACHE_HIERARCHY = sig
@@ -103,40 +334,290 @@ module type CACHE_HIERARCHY = sig
     ttl: int;
     access_count: int;
     last_access: timestamp;
+    cost: float;          (* 计算成本，用于价值评估 *)
+    size: int;            (* 条目大小 *)
+    version: int;         (* 版本号，用于一致性控制 *)
+    metadata: (string * string) list;
+  }
+
+  type cache_stats = {
+    hits: int64;
+    misses: int64;
+    evictions: int64;
+    size_bytes: int64;
+    entry_count: int;
   }
 
   val get : cache_level -> string -> cache_entry option
   val put : cache_level -> string -> bytes -> ttl:int -> unit
   val invalidate : cache_level -> string -> unit
   val promote : cache_entry -> cache_level -> cache_level -> unit
+  val get_stats : cache_level -> cache_stats
 end
 ```
 
-各级缓存的特征：
+#### 各级缓存的详细设计
 
-1. **L1 进程内缓存**
-   - 容量：10-100MB
-   - 延迟：<1μs
-   - 用途：热点查询结果、编译后的查询计划
+**1. L1 进程内缓存**
 
-2. **L2 本地共享缓存**
-   - 容量：1-10GB
-   - 延迟：<100μs
-   - 用途：常用倒排列表、文档片段
+进程内缓存是最接近应用的缓存层，具有极低的访问延迟：
 
-3. **L3 分布式缓存**
-   - 容量：100GB-1TB
-   - 延迟：<1ms
-   - 用途：完整查询结果、预计算聚合
+```ocaml
+module L1_Cache = struct
+  type config = {
+    max_size_mb: int;
+    max_entries: int;
+    ttl_seconds: int;
+    gc_interval: duration;
+  }
 
-4. **L4 边缘缓存**
-   - 容量：10-100GB
-   - 延迟：<10ms
-   - 用途：CDN缓存、地理分布
+  (* 使用并发哈希表实现 *)
+  type t = {
+    table: (string, cache_entry) CCHashtbl.t;
+    config: config;
+    stats: cache_stats Atomic.t;
+  }
+
+  let create config = {
+    table = CCHashtbl.create ~initial_size:1024 ();
+    config;
+    stats = Atomic.make empty_stats;
+  }
+end
+```
+
+特征：
+- **容量**：10-100MB（受进程内存限制）
+- **延迟**：<1μs（内存直接访问）
+- **用途**：
+  - 热点查询结果（如首页查询）
+  - 编译后的查询计划
+  - 会话相关数据
+  - 频繁访问的配置
+
+优化技术：
+- 无锁数据结构（lock-free hashtable）
+- 内存池减少分配开销
+- 引用计数避免深拷贝
+- CPU缓存行对齐
+
+**2. L2 本地共享缓存**
+
+本地共享缓存在单机多进程间共享，通常使用共享内存实现：
+
+```ocaml
+module L2_Cache = struct
+  type storage_backend = 
+    | Shared_memory of { shm_path: string; size: int }
+    | Local_redis of { unix_socket: string }
+    | Memory_mapped_file of { file_path: string }
+
+  type config = {
+    backend: storage_backend;
+    max_size_gb: int;
+    segment_size_mb: int;
+    num_segments: int;
+  }
+
+  (* 分段设计减少锁竞争 *)
+  let segment_for_key key num_segments =
+    (Hashtbl.hash key) mod num_segments
+end
+```
+
+特征：
+- **容量**：1-10GB
+- **延迟**：<100μs（跨进程通信）
+- **用途**：
+  - 常用倒排列表
+  - 文档片段缓存
+  - 词项词典
+  - 预计算的相关性分数
+
+优化技术：
+- 分段锁降低竞争
+- 内存映射文件持久化
+- 压缩存储节省空间
+- 批量操作减少系统调用
+
+**3. L3 分布式缓存**
+
+分布式缓存跨多个节点，提供大容量存储：
+
+```ocaml
+module L3_Cache = struct
+  type cluster_topology = 
+    | Consistent_hashing of { 
+        virtual_nodes: int; 
+        replication_factor: int 
+      }
+    | Range_sharding of { 
+        shard_count: int; 
+        rebalance_threshold: float 
+      }
+    | Hybrid_sharding of {
+        hot_keys_replicas: int;
+        normal_replicas: int;
+      }
+
+  type node = {
+    id: string;
+    address: network_address;
+    capacity: int64;
+    load: float;
+    status: node_status;
+  }
+
+  type routing_strategy = 
+    | Hash_based
+    | Key_affinity    (* 相关键路由到同一节点 *)
+    | Load_aware      (* 考虑节点负载 *)
+    | Geo_aware       (* 地理位置感知 *)
+end
+```
+
+特征：
+- **容量**：100GB-10TB
+- **延迟**：<1ms（网络往返）
+- **用途**：
+  - 完整查询结果
+  - 大型文档集合
+  - 预计算聚合结果
+  - 机器学习模型缓存
+
+优化技术：
+- 一致性哈希避免大规模数据迁移
+- 智能客户端减少跳转
+- 连接池复用TCP连接
+- 批量请求和管道化
+
+**4. L4 边缘缓存**
+
+边缘缓存部署在靠近用户的位置：
+
+```ocaml
+module L4_Edge_Cache = struct
+  type edge_location = {
+    region: string;
+    datacenter: string;
+    pop: string;  (* Point of Presence *)
+    capacity: cache_capacity;
+  }
+
+  type content_routing = 
+    | Geo_routing       (* 基于地理位置 *)
+    | Latency_based     (* 基于延迟测量 *)
+    | Cost_optimized    (* 考虑带宽成本 *)
+    | Hybrid_routing
+
+  type cache_policy = {
+    admission_policy: admission_control;
+    eviction_policy: eviction_algorithm;
+    refresh_policy: refresh_strategy;
+  }
+end
+```
+
+特征：
+- **容量**：10-100GB（每个PoP）
+- **延迟**：<10ms（取决于用户位置）
+- **用途**：
+  - 静态资源（JS、CSS、图片）
+  - 热门查询结果
+  - API响应缓存
+  - 个性化内容的公共部分
+
+优化技术：
+- 智能预取减少冷启动
+- 分层存储（SSD+HDD）
+- 带宽优化压缩
+- 请求合并减少回源
+
+#### 缓存层次间的协作
+
+多级缓存需要协同工作以最大化整体效率：
+
+```ocaml
+module Cache_Coordinator = struct
+  type lookup_strategy = 
+    | Sequential      (* L1->L2->L3->L4 *)
+    | Parallel        (* 并行查询多级 *)
+    | Adaptive        (* 基于历史调整 *)
+    | Bypass          (* 特定情况跳过某些层 *)
+
+  type promotion_policy = {
+    frequency_threshold: int;    (* 访问频率阈值 *)
+    recency_weight: float;       (* 时间权重 *)
+    size_limit: int;            (* 提升大小限制 *)
+    cost_benefit_ratio: float;   (* 成本收益比 *)
+  }
+
+  (* 多级缓存查找 *)
+  let hierarchical_lookup key strategy =
+    match strategy with
+    | Sequential ->
+        L1_Cache.get key
+        |> Option.or_else (fun () -> L2_Cache.get key)
+        |> Option.or_else (fun () -> L3_Cache.get key)
+        |> Option.or_else (fun () -> L4_Cache.get key)
+    
+    | Parallel ->
+        let futures = [
+          async { L1_Cache.get key };
+          async { L2_Cache.get key };
+          async { L3_Cache.get key };
+        ] in
+        Future.find_first_some futures
+    
+    | Adaptive ->
+        (* 基于键的特征选择查找路径 *)
+        adaptive_lookup key
+    
+    | Bypass ->
+        (* 大对象直接查询L3 *)
+        if is_large_key key then
+          L3_Cache.get key
+        else
+          hierarchical_lookup key Sequential
+end
+```
+
+#### 缓存设计的关键考虑
+
+1. **容量规划**
+   ```ocaml
+   type capacity_model = {
+     working_set_size: int64;
+     access_pattern: access_distribution;
+     growth_rate: float;
+     budget_constraint: cost;
+   }
+   
+   let plan_capacity model =
+     let base_size = estimate_working_set model in
+     let growth_buffer = base_size *. model.growth_rate in
+     let total_size = base_size +. growth_buffer in
+     distribute_across_levels total_size model.budget_constraint
+   ```
+
+2. **性能隔离**
+   - 不同租户/查询类型的缓存隔离
+   - 避免缓存污染
+   - QoS保证
+
+3. **故障处理**
+   - 缓存不可用时的降级
+   - 避免缓存穿透
+   - 熔断机制
+
+4. **监控与调优**
+   - 实时命中率监控
+   - 缓存效率分析
+   - 自动容量调整
 
 ### 14.2.2 缓存一致性策略
 
-分布式环境下的缓存一致性：
+在分布式环境下，缓存一致性是一个复杂但关键的问题。不同的一致性模型适用于不同的场景，需要在性能和正确性之间找到平衡。
 
 ```ocaml
 module type CACHE_CONSISTENCY = sig
@@ -145,31 +626,344 @@ module type CACHE_CONSISTENCY = sig
     | Write_back        (* 异步回写 *)
     | Write_around      (* 绕过缓存 *)
     | Refresh_ahead     (* 预刷新 *)
+    | Read_through      (* 读穿透 *)
+    | Write_behind      (* 延迟写入 *)
 
   type invalidation_strategy = 
-    | TTL_based         (* 基于时间 *)
-    | Event_based       (* 基于事件 *)
-    | Version_based     (* 基于版本 *)
-    | Hybrid           (* 混合策略 *)
+    | TTL_based of { ttl: duration }
+    | Event_based of { event_bus: message_queue }
+    | Version_based of { version_store: version_registry }
+    | Lease_based of { lease_duration: duration }
+    | Hybrid of invalidation_strategy list
+
+  type consistency_level = 
+    | Strong           (* 强一致性 *)
+    | Eventual        (* 最终一致性 *)
+    | Bounded_staleness of duration  (* 有界陈旧性 *)
+    | Session         (* 会话一致性 *)
+    | Causal          (* 因果一致性 *)
 
   val maintain_consistency : 
     model:consistency_model -> 
     strategy:invalidation_strategy -> 
+    level:consistency_level ->
     unit
 end
 ```
 
-关键设计决策：
+#### 一致性模型详解
 
-1. **失效传播机制**
-   - 发布订阅模式：使用消息队列广播失效事件
-   - 版本向量：跟踪数据版本避免过期读取
-   - 租约机制：限制缓存有效期降低不一致窗口
+**1. Write-through（写穿透）**
 
-2. **热点数据处理**
-   - 多副本：热点数据在多个节点缓存
-   - 请求合并：相同请求只触发一次后端查询
-   - 异步更新：后台线程预热即将过期的热点数据
+每次写操作同时更新缓存和后端存储：
+
+```ocaml
+module Write_Through = struct
+  let write key value =
+    (* 同时写入缓存和存储 *)
+    let write_results = 
+      Future.parallel [
+        async { Cache.put key value };
+        async { Storage.put key value }
+      ] in
+    
+    (* 等待两者都完成 *)
+    match Future.await_all write_results with
+    | Ok _ -> Ok ()
+    | Error e -> 
+        (* 回滚缓存写入 *)
+        Cache.invalidate key;
+        Error e
+end
+```
+
+优点：
+- 数据一致性强
+- 实现简单
+- 不会丢失数据
+
+缺点：
+- 写延迟高
+- 后端压力大
+- 可能造成缓存污染
+
+**2. Write-back（写回）**
+
+先写缓存，异步写回存储：
+
+```ocaml
+module Write_Back = struct
+  type write_buffer = {
+    pending: (string * value * timestamp) Queue.t;
+    max_size: int;
+    flush_interval: duration;
+    last_flush: timestamp;
+  }
+
+  let write key value buffer =
+    (* 立即写入缓存 *)
+    Cache.put key value ~dirty:true;
+    
+    (* 加入写回队列 *)
+    Queue.push (key, value, now()) buffer.pending;
+    
+    (* 检查是否需要刷新 *)
+    if should_flush buffer then
+      async { flush_buffer buffer }
+    else
+      Ok ()
+end
+```
+
+优点：
+- 写延迟低
+- 批量写入优化
+- 减轻后端压力
+
+缺点：
+- 可能丢失数据
+- 实现复杂
+- 需要处理崩溃恢复
+
+**3. Refresh-ahead（预刷新）**
+
+在数据过期前主动刷新：
+
+```ocaml
+module Refresh_Ahead = struct
+  type refresh_config = {
+    refresh_threshold: float;  (* 0.8 = 80% TTL时刷新 *)
+    batch_size: int;
+    concurrent_refreshes: int;
+  }
+
+  let monitor_expiration config =
+    let scheduler = create_scheduler () in
+    
+    Cache.iter_entries (fun key entry ->
+      let ttl_remaining = entry.expiry -. now() in
+      let refresh_time = ttl_remaining *. config.refresh_threshold in
+      
+      if is_frequently_accessed entry then
+        schedule_at scheduler refresh_time (fun () ->
+          refresh_entry key entry
+        )
+    )
+end
+```
+
+#### 失效传播机制
+
+**1. 基于事件的失效**
+
+使用消息队列广播失效事件：
+
+```ocaml
+module Event_Based_Invalidation = struct
+  type invalidation_event = {
+    key: string;
+    timestamp: timestamp;
+    source_node: node_id;
+    reason: invalidation_reason;
+  }
+
+  let setup_invalidation_bus () =
+    let bus = create_message_bus "cache-invalidation" in
+    
+    (* 订阅失效事件 *)
+    subscribe bus (fun event ->
+      match event with
+      | Invalidate { key; timestamp; _ } ->
+          if Cache.exists key then
+            let entry = Cache.get key in
+            if entry.last_modified < timestamp then
+              Cache.invalidate key
+      
+      | InvalidatePattern { pattern; _ } ->
+          Cache.invalidate_matching pattern
+    )
+end
+```
+
+**2. 版本向量机制**
+
+使用版本号跟踪数据新旧：
+
+```ocaml
+module Version_Vector = struct
+  type version_vector = (node_id * int) list
+  
+  type versioned_entry = {
+    key: string;
+    value: value;
+    vector: version_vector;
+  }
+
+  let compare_versions v1 v2 =
+    let rec cmp v1 v2 =
+      match v1, v2 with
+      | [], [] -> Equal
+      | [], _ -> Older
+      | _, [] -> Newer
+      | (n1, c1)::rest1, (n2, c2)::rest2 ->
+          if n1 = n2 then
+            if c1 < c2 then Older
+            else if c1 > c2 then Newer
+            else cmp rest1 rest2
+          else
+            Concurrent
+    in
+    cmp (List.sort compare v1) (List.sort compare v2)
+
+  let merge_on_read entries =
+    (* 合并并发版本 *)
+    match find_latest_common_ancestor entries with
+    | Some ancestor -> 
+        resolve_conflicts ancestor entries
+    | None -> 
+        application_specific_merge entries
+end
+```
+
+**3. 租约机制**
+
+通过租约限制缓存有效期：
+
+```ocaml
+module Lease_Based = struct
+  type lease = {
+    key: string;
+    holder: node_id;
+    expiry: timestamp;
+    renewable: bool;
+  }
+
+  type lease_manager = {
+    leases: (string, lease) Hashtbl.t;
+    renewal_threshold: float;
+  }
+
+  let acquire_lease manager key node_id duration =
+    match Hashtbl.find_opt manager.leases key with
+    | None ->
+        let lease = {
+          key; 
+          holder = node_id;
+          expiry = now() +. duration;
+          renewable = true;
+        } in
+        Hashtbl.add manager.leases key lease;
+        Ok lease
+    
+    | Some existing ->
+        if existing.expiry < now() then
+          (* 租约已过期，可以获取 *)
+          acquire_lease manager key node_id duration
+        else
+          Error `LeaseHeld
+end
+```
+
+#### 热点数据处理
+
+处理热点数据需要特殊的策略以避免缓存击穿和雪崩：
+
+**1. 请求合并（Request Coalescing）**
+
+```ocaml
+module Request_Coalescing = struct
+  type inflight_request = {
+    key: string;
+    future: value Future.t;
+    waiters: (value -> unit) list;
+  }
+
+  let coalesced_get key =
+    match find_inflight key with
+    | Some request ->
+        (* 已有相同请求在处理，等待结果 *)
+        Future.map request.future (fun v -> v)
+    
+    | None ->
+        (* 创建新请求 *)
+        let future = 
+          register_inflight key;
+          async {
+            let! value = fetch_from_backend key in
+            notify_waiters key value;
+            unregister_inflight key;
+            value
+          }
+        in
+        future
+end
+```
+
+**2. 多副本策略**
+
+```ocaml
+module Multi_Replica = struct
+  type replication_strategy = 
+    | Fixed_replicas of int
+    | Adaptive_replicas of {
+        min_replicas: int;
+        max_replicas: int;
+        load_threshold: float;
+      }
+    | Geo_replicas of {
+        regions: string list;
+        cross_region_latency: duration;
+      }
+
+  let replicate_hot_data key value strategy =
+    let access_rate = get_access_rate key in
+    let num_replicas = 
+      match strategy with
+      | Fixed_replicas n -> n
+      | Adaptive_replicas config ->
+          let replicas = 
+            int_of_float (access_rate /. config.load_threshold) in
+          min config.max_replicas (max config.min_replicas replicas)
+      | Geo_replicas config ->
+          List.length config.regions
+    in
+    
+    distribute_replicas key value num_replicas
+end
+```
+
+**3. 异步预热**
+
+```ocaml
+module Async_Warming = struct
+  type warming_strategy = {
+    prediction_model: access_predictor;
+    warming_threads: int;
+    batch_size: int;
+    priority_queue: priority_queue;
+  }
+
+  let predictive_warming strategy =
+    let predictor = strategy.prediction_model in
+    
+    (* 预测即将被访问的数据 *)
+    let predictions = predictor.predict_next_period () in
+    
+    (* 按预测概率排序 *)
+    let sorted = 
+      List.sort (fun a b -> 
+        Float.compare b.probability a.probability
+      ) predictions in
+    
+    (* 异步预热 *)
+    List.iter (fun pred ->
+      if pred.probability > 0.7 then
+        async {
+          warm_cache pred.key pred.expected_time
+        }
+    ) sorted
+end
+```
 
 ### 14.2.3 缓存预热与淘汰
 
