@@ -4,7 +4,7 @@
 
 ## 9.1 嵌入模型的服务化设计
 
-将嵌入模型部署为独立服务是向量搜索系统的第一步。这种设计不仅提供了更好的资源隔离和扩展性，还支持模型的热更新和 A/B 测试。
+将嵌入模型部署为独立服务是向量搜索系统的第一步。这种设计不仅提供了更好的资源隔离和扩展性，还支持模型的热更新和 A/B 测试。现代搜索系统通常需要处理每秒数万次的嵌入请求，服务化架构使得我们可以独立扩展计算资源，并在不影响索引服务的情况下更新模型。
 
 ### 9.1.1 模型服务接口定义
 
@@ -16,42 +16,90 @@ module type EmbeddingService = sig
     texts: string array;
     model: model_id option;
     normalize: bool;
+    truncate_strategy: [`Head | `Tail | `Middle] option;
+    pooling_strategy: [`Mean | `CLS | `Max | `AttentionWeighted] option;
   }
   
   type batch_response = {
     embeddings: vector array;
     model_used: model_id;
     latency_ms: float;
+    token_counts: int array option;
+  }
+  
+  type stream_config = {
+    buffer_size: int;
+    flush_interval_ms: int;
+    error_handling: [`Skip | `Retry of int | `Fail];
   }
   
   val embed_batch : batch_request -> batch_response Lwt.t
-  val embed_stream : string Lwt_stream.t -> vector Lwt_stream.t
+  val embed_stream : stream_config -> string Lwt_stream.t -> vector Lwt_stream.t
   val available_models : unit -> model_id list
   val model_info : model_id -> model_metadata option
+  val preload_model : model_id -> unit Lwt.t
+  val unload_model : model_id -> unit Lwt.t
 end
 ```
 
-这个接口设计考虑了几个关键点：
-- **批处理支持**：通过 `embed_batch` 提高吞吐量
-- **流式处理**：`embed_stream` 支持实时场景
-- **模型选择**：允许指定特定模型或使用默认模型
+这个扩展的接口设计考虑了更多生产环境的需求：
+- **批处理支持**：通过 `embed_batch` 提高吞吐量，支持向量化计算
+- **流式处理**：`embed_stream` 支持实时场景，配置缓冲和错误处理
+- **模型选择**：允许指定特定模型或使用默认模型，支持多模型并存
 - **归一化选项**：某些算法（如余弦相似度）需要归一化向量
+- **截断策略**：处理超长文本的不同方式，保留最重要的信息
+- **池化策略**：从 token 嵌入聚合到句子嵌入的不同方法
+- **模型管理**：预加载和卸载模型，优化内存使用
+
+关键设计决策：
+- **异步接口**：使用 `Lwt.t` 支持非阻塞调用，提高并发性能
+- **批次优先**：鼓励批处理以充分利用 GPU 并行计算能力
+- **灵活配置**：通过参数控制各种处理策略，适应不同场景
+- **可观测性**：返回延迟和 token 数量等元信息，便于监控调优
 
 ### 9.1.2 批处理与流式处理的权衡
 
-批处理和流式处理各有适用场景：
+批处理和流式处理各有适用场景，选择合适的处理模式对系统性能至关重要：
 
-**批处理优化**：
-- 动态批次大小：根据 GPU 利用率自适应调整
-- 批次超时机制：避免小批次等待过久
-- 优先级队列：支持不同延迟要求的请求
+**批处理优化策略**：
+- **动态批次大小**：根据 GPU 利用率自适应调整，典型范围 32-512
+- **批次超时机制**：避免小批次等待过久，通常设置 50-100ms 超时
+- **优先级队列**：支持不同延迟要求的请求，实时查询优先于离线索引
+- **填充优化**：使用 attention mask 处理变长输入，减少无效计算
+- **内存池化**：预分配张量内存，避免频繁的内存分配开销
+
+批处理的典型实现模式：
+```ocaml
+module type BatchOptimizer = sig
+  type batch_policy = {
+    min_batch_size: int;      (* 最小批次，避免 GPU 利用不足 *)
+    max_batch_size: int;      (* 最大批次，受限于 GPU 内存 *)
+    timeout_ms: int;          (* 等待超时，平衡延迟和吞吐量 *)
+    priority_levels: int;     (* 优先级队列数量 *)
+  }
+  
+  val adaptive_batching : unit -> batch_policy
+  val gpu_utilization : unit -> float
+  val queue_depth : priority:int -> int
+end
+```
 
 **流式处理考虑**：
-- 微批次聚合：将短时间窗口内的请求合并
-- 背压控制：防止下游处理跟不上嵌入生成速度
-- 增量更新：支持文档修改时的部分重新嵌入
+- **微批次聚合**：将短时间窗口内的请求合并，典型窗口 10-50ms
+- **背压控制**：防止下游处理跟不上嵌入生成速度，实现令牌桶或漏桶算法
+- **增量更新**：支持文档修改时的部分重新嵌入，使用差分计算
+- **状态管理**：维护流处理状态，支持断点续传和故障恢复
+- **窗口计算**：对长文档使用滑动窗口，保持上下文连续性
+
+流式处理的关键指标：
+- **端到端延迟**：从输入到输出的总时间，目标 <100ms
+- **吞吐量稳定性**：处理速率的方差，避免突发抖动
+- **资源利用率**：CPU/GPU/内存的使用效率
+- **队列深度**：各阶段的积压情况，及时发现瓶颈
 
 ### 9.1.3 模型版本管理
+
+生产环境中的模型版本管理是确保系统稳定性和支持持续改进的关键：
 
 ```ocaml
 module type ModelRegistry = sig
@@ -61,74 +109,220 @@ module type ModelRegistry = sig
     dimensions: int;
     architecture: string;
     training_data: string;
+    performance_metrics: performance_stats;
+    compatibility_matrix: (string * bool) list;  (* 与其他版本的兼容性 *)
   }
   
-  val register_model : model_path -> version -> unit
+  type deployment_strategy = 
+    | BlueGreen                    (* 瞬时切换 *)
+    | Canary of float              (* 渐进式金丝雀发布 *)
+    | Shadow                       (* 影子模式对比测试 *)
+    | FeatureFlag of string list   (* 基于特征标志的发布 *)
+  
+  val register_model : model_path -> version -> validation_result
   val get_active_version : model_id -> version option
   val set_traffic_split : model_id -> (version * float) list -> unit
   val rollback : model_id -> version -> unit
+  val health_check : version -> health_status
+  val deprecate_version : version -> deprecation_schedule -> unit
 end
 ```
 
 版本管理的关键考虑：
-- **向后兼容性**：新模型应保持相同的向量维度
-- **渐进式部署**：通过流量分割进行 A/B 测试
-- **快速回滚**：保留多个版本支持即时切换
+- **向后兼容性**：新模型应保持相同的向量维度，或提供映射层
+- **渐进式部署**：通过流量分割进行 A/B 测试，监控关键指标
+- **快速回滚**：保留多个版本支持即时切换，维护回滚决策树
+- **性能基准**：每个版本都需要通过性能和质量基准测试
+- **依赖管理**：跟踪模型依赖的库版本，确保运行环境一致
 
-### 9.1.4 缓存策略
-
-嵌入计算是 CPU/GPU 密集型操作，合理的缓存策略可以显著提升性能：
-
+版本迁移策略：
 ```ocaml
-module type EmbeddingCache = sig
-  type cache_key = string * model_id
-  type cache_value = vector * timestamp
+module type VersionMigration = sig
+  type migration_plan = {
+    source_version: version;
+    target_version: version;
+    vector_transformer: vector -> vector option;  (* 维度转换 *)
+    index_rebuild_required: bool;
+    estimated_downtime: duration;
+  }
   
-  val get : cache_key -> cache_value option
-  val put : cache_key -> cache_value -> unit
-  val invalidate_model : model_id -> unit
-  val eviction_policy : [`LRU | `LFU | `FIFO | `TTL of duration]
+  val plan_migration : version -> version -> migration_plan
+  val execute_migration : migration_plan -> migration_result Lwt.t
+  val validate_migration : migration_result -> validation_report
 end
 ```
 
-缓存设计要点：
-- **多级缓存**：内存缓存 + Redis + 持久化存储
-- **一致性哈希**：分布式缓存的键分配
-- **预热机制**：对热门内容提前计算嵌入
-- **失效策略**：模型更新时的缓存清理
+实践中的注意事项：
+- **双写期**：新旧版本并行计算，确保平滑过渡
+- **回滚窗口**：保留足够长的观察期，通常 24-72 小时
+- **监控指标**：延迟、召回率、用户满意度等多维度监控
+- **自动化测试**：版本发布前的自动化质量和性能测试
+
+### 9.1.4 缓存策略
+
+嵌入计算是 CPU/GPU 密集型操作，合理的缓存策略可以显著提升性能。一个精心设计的缓存系统可以将常见查询的延迟从 50ms 降低到 1ms 以下：
+
+```ocaml
+module type EmbeddingCache = sig
+  type cache_key = string * model_id * cache_variant
+  type cache_value = {
+    vector: vector;
+    timestamp: timestamp;
+    hit_count: int;
+    compute_time_ms: float;
+    metadata: (string * string) list;
+  }
+  
+  type cache_stats = {
+    hit_rate: float;
+    miss_rate: float;
+    eviction_rate: float;
+    avg_latency_ms: float;
+    memory_usage_mb: float;
+  }
+  
+  type eviction_policy = 
+    | LRU                          (* 最近最少使用 *)
+    | LFU                          (* 最不经常使用 *)
+    | FIFO                         (* 先进先出 *)
+    | TTL of duration              (* 基于时间的过期 *)
+    | ARC                          (* 自适应替换缓存 *)
+    | W_TinyLFU                    (* 窗口化 TinyLFU *)
+    | Custom of (cache_key -> cache_value -> float)  (* 自定义评分函数 *)
+  
+  val get : cache_key -> cache_value option
+  val get_batch : cache_key list -> (cache_key * cache_value option) list
+  val put : cache_key -> cache_value -> unit
+  val put_batch : (cache_key * cache_value) list -> unit
+  val invalidate_model : model_id -> int  (* 返回失效条目数 *)
+  val invalidate_pattern : string -> int   (* 支持通配符失效 *)
+  val stats : unit -> cache_stats
+  val resize : int -> unit                 (* 动态调整缓存大小 *)
+end
+```
+
+缓存架构设计要点：
+
+**多级缓存架构**：
+- **L1 进程内缓存**：最快访问，容量有限（典型 1-10GB）
+- **L2 分布式缓存**：Redis/Memcached，跨进程共享（10-100GB）
+- **L3 持久化缓存**：SSD/对象存储，容量大但延迟高（TB 级别）
+- **边缘缓存**：CDN 节点，降低跨地域延迟
+
+**一致性哈希实现**：
+```ocaml
+module type ConsistentHashing = sig
+  type node = {
+    id: string;
+    weight: float;
+    virtual_nodes: int;  (* 虚拟节点数，提高均匀性 *)
+  }
+  
+  val add_node : node -> unit
+  val remove_node : string -> unit
+  val get_node : cache_key -> node
+  val rebalance : unit -> migration_plan
+end
+```
+
+**智能预热机制**：
+- **基于历史**：分析访问日志，预热高频内容
+- **基于预测**：使用时间序列预测未来热点
+- **基于相似度**：预热语义相似的内容
+- **增量预热**：避免预热风暴，分批加载
+
+**失效策略优化**：
+- **级联失效**：模型更新时的多级缓存同步清理
+- **延迟失效**：标记失效但延迟删除，支持回滚
+- **部分失效**：只失效受影响的缓存子集
+- **版本隔离**：不同模型版本使用独立的缓存命名空间
+
+**高级优化技术**：
+- **布隆过滤器**：快速判断缓存是否存在，减少无效查询
+- **缓存压缩**：使用向量量化减少内存占用
+- **访问模式学习**：自适应调整缓存策略
+- **缓存共享**：相似查询共享缓存结果
 
 ## 9.2 向量索引的数据结构选择
 
-选择合适的向量索引结构是构建高性能向量搜索系统的关键。不同的数据结构在构建时间、查询性能、内存占用和召回率之间有不同的权衡。
+选择合适的向量索引结构是构建高性能向量搜索系统的关键。不同的数据结构在构建时间、查询性能、内存占用和召回率之间有不同的权衡。理解每种数据结构的原理和适用场景，对于设计满足特定需求的搜索系统至关重要。
 
 ### 9.2.1 LSH (Locality Sensitive Hashing)
 
-LSH 是最早的近似最近邻算法之一，通过哈希函数将相似的向量映射到相同的桶中。
+LSH 是最早的近似最近邻算法之一，通过哈希函数将相似的向量映射到相同的桶中。其核心思想是设计特殊的哈希函数族，使得相似的向量有更高的概率被映射到同一个桶。
 
 ```ocaml
 module type LSH_Index = sig
   type hash_family = {
-    num_tables: int;
-    num_hashes_per_table: int;
-    projection_dim: int;
+    num_tables: int;           (* L: 哈希表数量 *)
+    num_hashes_per_table: int; (* K: 每个表的哈希函数数 *)
+    projection_dim: int;       (* 投影维度 *)
+    seed: int option;          (* 随机种子，确保可重现性 *)
   }
   
   type lsh_config = {
     families: hash_family list;
-    amplification: int;  (* 多探测参数 *)
+    amplification: int;        (* 多探测参数，增加召回率 *)
+    bucket_width: float;       (* W: 哈希桶宽度 *)
+    distance_func: [`L2 | `Cosine | `Hamming];
+  }
+  
+  type query_config = {
+    num_probes: int;           (* 探测邻近桶的数量 *)
+    early_termination: int option;  (* 找到足够结果后提前终止 *)
   }
   
   val build : vector array -> lsh_config -> t
-  val query : t -> vector -> int -> (int * float) list
+  val query : t -> vector -> query_config -> int -> (int * float) list
   val add_vector : t -> int -> vector -> unit
+  val remove_vector : t -> int -> unit
+  val optimize_params : vector array -> query array -> lsh_config
 end
 ```
 
-LSH 的关键设计考虑：
-- **哈希函数族选择**：Random Projection、MinHash、SimHash
-- **多表设计**：增加表数量提高召回率但增加内存
-- **动态扩展**：支持在线添加新向量
-- **参数调优**：平衡精度与效率的超参数选择
+LSH 的核心原理和实现细节：
+
+**哈希函数族设计**：
+- **Random Projection (角度 LSH)**：适用于余弦相似度
+  - 使用随机超平面将空间二分
+  - 哈希值 = sgn(v · r)，r 是随机向量
+- **p-stable LSH**：适用于 Lp 距离
+  - 使用稳定分布的投影，如高斯分布（L2）或柯西分布（L1）
+  - 哈希值 = ⌊(v · a + b) / w⌋
+- **MinHash**：适用于 Jaccard 相似度
+  - 主要用于集合相似性，文档去重
+- **SimHash**：适用于汉明距离
+  - 用于高维二进制向量
+
+**多表设计策略**：
+- **独立哈希表**：每个表使用不同的哈希函数组
+- **表数量权衡**：L 越大，召回率越高，但内存和查询时间增加
+- **组合键设计**：K 个哈希值组合成一个键，K 越大，精度越高但碰撞越少
+
+**动态扩展优化**：
+- **增量构建**：支持在线添加新向量，无需重建整个索引
+- **桶分裂策略**：当桶过大时自动分裂，保持查询效率
+- **并发控制**：使用细粒度锁支持并发读写
+
+**参数自动调优**：
+```ocaml
+module type LSHOptimizer = sig
+  type optimization_target = 
+    | RecallAtK of int * float    (* 目标召回率 *)
+    | LatencyBound of float        (* 延迟上界 *)
+    | MemoryBound of int64         (* 内存上界 *)
+  
+  val grid_search : param_ranges -> optimization_target -> lsh_config
+  val bayesian_optimize : initial_configs -> optimization_target -> lsh_config
+  val adaptive_tuning : runtime_stats -> lsh_config -> lsh_config
+end
+```
+
+**实际应用考虑**：
+- **数据分布敏感**：LSH 对数据分布假设较强，非均匀分布效果下降
+- **高维诅咒**：维度增加时，需要更多的哈希表保证召回率
+- **查询时优化**：多探测、查询感知的动态参数调整
+- **混合索引**：LSH 作为粗筛，结合精确计算提高质量
 
 ### 9.2.2 IVF (Inverted File Index)
 
