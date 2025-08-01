@@ -120,11 +120,197 @@ end
 2. 并行执行分片查询
 3. 收集并合并结果
 
+这种模式的关键挑战在于：
+- **尾延迟问题**: 最慢的分片决定整体延迟
+- **部分失败处理**: 某些分片超时时的降级策略
+- **资源效率**: 避免查询无关分片
+
 **智能路由优化**
 
 - **Bloom Filter 预过滤**: 避免查询不包含目标词项的分片
 - **统计信息路由**: 基于词频分布优化查询计划
 - **自适应超时**: 根据历史延迟动态调整超时时间
+
+```ocaml
+module SmartRouter = struct
+  (* 分片摘要信息 *)
+  type shard_summary = {
+    shard_id: shard_id;
+    bloom_filter: bloom_filter;
+    term_statistics: term_stats;
+    latency_p99: float;
+  }
+  
+  (* 查询剪枝 *)
+  let prune_shards query summaries =
+    summaries
+    |> List.filter (fun s ->
+      query.terms 
+      |> List.exists (fun term ->
+        BloomFilter.might_contain s.bloom_filter term))
+        
+  (* 动态超时计算 *)
+  let calculate_timeout query shard_latencies =
+    let base_timeout = 100 in  (* 基础超时 100ms *)
+    let p99_latency = Statistics.percentile 0.99 shard_latencies in
+    min (base_timeout + int_of_float (p99_latency *. 1.5)) 1000
+end
+```
+
+**查询复写与优化**
+
+在路由之前，可以对查询进行优化：
+
+1. **同义词扩展**: 在路由层处理可减少分片计算
+2. **停用词过滤**: 避免高频词造成的负载倾斜
+3. **查询重写**: 将复杂查询分解为更高效的子查询
+
+### 10.1.4 负载均衡策略 (Load Balancing)
+
+**分片负载评估**
+
+```ocaml
+module type LOAD_BALANCER = sig
+  type load_metric = {
+    cpu_usage: float;
+    memory_usage: float;
+    qps: int;
+    avg_latency_ms: float;
+    queue_length: int;
+  }
+  
+  type routing_decision = 
+    | Primary of shard_id
+    | Replica of shard_id * replica_id
+    | Reject  (* 过载保护 *)
+    
+  val select_replica : shard_id -> load_metric list -> routing_decision
+  val rebalance_shards : load_metric list -> rebalancing_plan
+end
+```
+
+**动态负载均衡算法**
+
+1. **加权轮询 (Weighted Round Robin)**
+   - 根据节点容量分配权重
+   - 适合负载相对稳定的场景
+
+2. **最小连接数 (Least Connections)**
+   - 选择当前连接数最少的节点
+   - 适合长连接场景
+
+3. **响应时间感知 (Response Time Aware)**
+   - 优先选择响应时间短的节点
+   - 需要持续监控和统计
+
+4. **一致性哈希 (Consistent Hashing)**
+   - 保证相同查询路由到相同节点
+   - 有利于缓存命中率
+
+**热点缓解策略**
+
+当某些分片成为热点时：
+
+```ocaml
+module HotspotMitigation = struct
+  type mitigation_strategy =
+    | AddReplicas of int          (* 增加副本数 *)
+    | SplitShard of split_point   (* 分裂分片 *)
+    | CachePopular of cache_config (* 缓存热数据 *)
+    | RateLimiting of rate_config (* 限流保护 *)
+    
+  let detect_hotspot metrics threshold =
+    metrics
+    |> List.filter (fun m -> 
+      m.cpu_usage > threshold.cpu_threshold ||
+      m.qps > threshold.qps_threshold)
+      
+  let apply_mitigation shard_id strategy =
+    match strategy with
+    | AddReplicas n -> 
+        (* 动态增加副本 *)
+    | SplitShard point ->
+        (* 分裂过热分片 *)
+    | _ -> (* 其他策略 *)
+end
+```
+
+### 10.1.5 分片再平衡 (Shard Rebalancing)
+
+**触发条件**
+
+分片再平衡通常由以下条件触发：
+
+1. **容量触发**: 某分片接近存储上限
+2. **性能触发**: 负载严重不均
+3. **扩容触发**: 添加新节点
+4. **故障触发**: 节点故障后的数据重分布
+
+**再平衡算法**
+
+```ocaml
+module type REBALANCER = sig
+  type rebalance_plan = {
+    moves: (doc_range * source_shard * target_shard) list;
+    estimated_duration: int;
+    data_size_bytes: int64;
+  }
+  
+  type constraints = {
+    max_concurrent_moves: int;
+    bandwidth_limit_mbps: int;
+    business_hours_only: bool;
+  }
+  
+  val plan_rebalance : 
+    current_distribution -> 
+    target_distribution -> 
+    constraints -> 
+    rebalance_plan
+    
+  val execute_rebalance : 
+    rebalance_plan -> 
+    progress Lwt_stream.t
+end
+```
+
+**最小化数据移动**
+
+再平衡的关键是最小化数据移动量：
+
+1. **贪心算法**: 每次选择能最大改善平衡度的移动
+2. **线性规划**: 将问题建模为优化问题
+3. **启发式算法**: 基于经验规则的快速近似
+
+**在线再平衡**
+
+支持不停机的再平衡：
+
+```ocaml
+module OnlineRebalancing = struct
+  type migration_state =
+    | Preparing      (* 准备阶段 *)
+    | Copying        (* 数据复制 *)
+    | Catching_up    (* 追赶更新 *)
+    | Switching      (* 切换流量 *)
+    | Cleaning_up    (* 清理旧数据 *)
+    
+  let migrate_shard_range source target range =
+    (* 1. 开始复制历史数据 *)
+    let* snapshot = create_snapshot source range in
+    let* () = copy_to_target target snapshot in
+    
+    (* 2. 追赶实时更新 *)
+    let* update_stream = subscribe_updates source range in
+    let* () = replay_updates target update_stream in
+    
+    (* 3. 原子切换 *)
+    let* () = update_routing_table range target in
+    
+    (* 4. 清理源数据 *)
+    cleanup_source source range
+end
+```
 
 ## 10.2 一致性模型的选择 (Consistency Models)
 
@@ -210,6 +396,279 @@ module type MIXED_CONSISTENCY = sig
     
   val classify_data : data_type -> data_class
   val get_consistency_level : data_class -> consistency_level
+end
+```
+
+**数据分类策略**
+
+不同类型的数据需要不同的一致性保证：
+
+1. **索引数据**
+   - 倒排列表: 最终一致性（可接受短暂不一致）
+   - 文档元数据: 有界陈旧性（影响排序准确性）
+   - 删除标记: 强一致性（避免显示已删除文档）
+
+2. **用户数据**
+   - 搜索历史: 会话一致性（用户看到自己的操作）
+   - 个性化设置: 强一致性（立即生效）
+   - 点击日志: 最终一致性（用于离线分析）
+
+3. **系统元数据**
+   - 分片映射: 强一致性（路由正确性）
+   - 配置信息: 有界陈旧性（可容忍短暂延迟）
+   - 监控数据: 最终一致性（趋势分析）
+
+```ocaml
+module AdaptiveConsistency = struct
+  (* 动态调整一致性级别 *)
+  type consistency_selector = {
+    mutable default_level: consistency_level;
+    overrides: (data_type, consistency_level) Hashtbl.t;
+    load_threshold: float;
+  }
+  
+  let select_consistency selector data_type current_load =
+    match Hashtbl.find_opt selector.overrides data_type with
+    | Some level -> level
+    | None ->
+        (* 高负载时降级一致性要求 *)
+        if current_load > selector.load_threshold then
+          downgrade_consistency selector.default_level
+        else
+          selector.default_level
+          
+  let downgrade_consistency = function
+    | Strong -> BoundedStaleness 5
+    | BoundedStaleness n -> BoundedStaleness (n * 2)
+    | SessionConsistent -> Eventual
+    | Eventual -> Eventual
+end
+```
+
+### 10.2.5 读写分离与一致性 (Read-Write Separation)
+
+**读写分离架构**
+
+```ocaml
+module type READ_WRITE_SEPARATION = sig
+  type write_concern = {
+    w: int;              (* 写入副本数 *)
+    j: bool;             (* 是否等待持久化 *)
+    timeout_ms: int;     (* 写入超时 *)
+  }
+  
+  type read_preference = 
+    | Primary            (* 只读主节点 *)
+    | PrimaryPreferred   (* 优先主节点 *)
+    | Secondary         (* 只读从节点 *)
+    | SecondaryPreferred (* 优先从节点 *)
+    | Nearest           (* 最近节点 *)
+    
+  val write : key -> value -> write_concern -> unit Lwt.t
+  val read : key -> read_preference -> value option Lwt.t
+end
+```
+
+**读一致性保证**
+
+确保读取到最新写入的数据：
+
+1. **Read-after-Write 一致性**
+   ```ocaml
+   module ReadAfterWrite = struct
+     type session_token = {
+       client_id: string;
+       last_write_version: version;
+       timestamp: float;
+     }
+     
+     let ensure_read_after_write token read_preference =
+       match read_preference with
+       | Secondary | SecondaryPreferred ->
+           (* 检查从节点是否已同步到所需版本 *)
+           wait_for_replication token.last_write_version
+       | _ -> Lwt.return_unit
+   end
+   ```
+
+2. **单调读一致性**
+   ```ocaml
+   module MonotonicReads = struct
+     (* 确保后续读取不会看到更旧的数据 *)
+     type read_tracker = {
+       mutable last_read_version: version;
+       mutable last_read_node: node_id;
+     }
+     
+     let select_read_node tracker available_nodes =
+       (* 优先选择上次读取的节点或更新的节点 *)
+       available_nodes
+       |> List.filter (fun node ->
+         get_node_version node >= tracker.last_read_version)
+       |> select_best_node
+   end
+   ```
+
+### 10.2.6 时钟同步与时序一致性 (Clock Synchronization)
+
+分布式系统中的时间同步对一致性至关重要：
+
+**混合逻辑时钟 (Hybrid Logical Clock)**
+
+```ocaml
+module HybridLogicalClock = struct
+  type hlc = {
+    physical_time: int64;
+    logical_time: int;
+    node_id: node_id;
+  }
+  
+  let compare hlc1 hlc2 =
+    match Int64.compare hlc1.physical_time hlc2.physical_time with
+    | 0 -> 
+        (match Int.compare hlc1.logical_time hlc2.logical_time with
+         | 0 -> String.compare hlc1.node_id hlc2.node_id
+         | n -> n)
+    | n -> n
+    
+  let update local_hlc received_hlc =
+    let physical_now = Unix.gettimeofday () |> Int64.of_float in
+    let max_physical = Int64.max local_hlc.physical_time 
+                                  received_hlc.physical_time in
+    let new_physical = Int64.max physical_now max_physical in
+    
+    let new_logical = 
+      if new_physical = local_hlc.physical_time &&
+         new_physical = received_hlc.physical_time then
+        (max local_hlc.logical_time received_hlc.logical_time) + 1
+      else if new_physical = local_hlc.physical_time then
+        local_hlc.logical_time + 1
+      else if new_physical = received_hlc.physical_time then
+        received_hlc.logical_time + 1
+      else
+        0
+    in
+    
+    { physical_time = new_physical;
+      logical_time = new_logical;
+      node_id = local_hlc.node_id }
+end
+```
+
+**TrueTime API 风格的设计**
+
+受 Google Spanner 启发的时间不确定性处理：
+
+```ocaml
+module BoundedTime = struct
+  type time_bound = {
+    earliest: float;
+    latest: float;
+  }
+  
+  (* 获取当前时间的上下界 *)
+  let now () =
+    let current = Unix.gettimeofday () in
+    let uncertainty = estimate_clock_uncertainty () in
+    { earliest = current -. uncertainty;
+      latest = current +. uncertainty }
+    
+  (* 等待直到确定时间已过 *)
+  let wait_until timestamp =
+    let rec wait () =
+      let bound = now () in
+      if bound.earliest > timestamp then
+        Lwt.return_unit
+      else
+        let* () = Lwt_unix.sleep 0.001 in
+        wait ()
+    in
+    wait ()
+end
+```
+
+### 10.2.7 分布式事务与一致性 (Distributed Transactions)
+
+虽然搜索系统通常避免分布式事务，但某些场景仍需要：
+
+**两阶段提交 (2PC)**
+
+```ocaml
+module TwoPhaseCommit = struct
+  type transaction_id = string
+  type participant_vote = Commit | Abort
+  
+  type coordinator_state =
+    | Preparing
+    | Committing
+    | Aborting
+    | Completed
+    
+  module Coordinator = struct
+    let execute_2pc participants transaction =
+      (* Phase 1: Prepare *)
+      let* votes = 
+        participants
+        |> Lwt_list.map_p (fun p ->
+          timeout (prepare_transaction p transaction) 5.0)
+      in
+      
+      (* Decision *)
+      let decision = 
+        if List.for_all ((=) Commit) votes then
+          Commit
+        else
+          Abort
+      in
+      
+      (* Phase 2: Commit/Abort *)
+      let* () = 
+        participants
+        |> Lwt_list.iter_p (fun p ->
+          match decision with
+          | Commit -> commit_transaction p transaction
+          | Abort -> abort_transaction p transaction)
+      in
+      
+      Lwt.return decision
+  end
+end
+```
+
+**Saga 模式**
+
+对于长时间运行的操作，使用补偿事务：
+
+```ocaml
+module Saga = struct
+  type 'a step = {
+    forward: unit -> 'a Lwt.t;
+    compensate: 'a -> unit Lwt.t;
+  }
+  
+  type 'a saga = 'a step list
+  
+  let execute_saga steps =
+    let rec run completed remaining =
+      match remaining with
+      | [] -> Lwt.return (Ok (List.rev completed))
+      | step :: rest ->
+          Lwt.catch
+            (fun () ->
+              let* result = step.forward () in
+              run ((step, result) :: completed) rest)
+            (fun exn ->
+              (* 补偿已完成的步骤 *)
+              let* () = 
+                completed
+                |> Lwt_list.iter_s (fun (s, r) ->
+                  Lwt.catch
+                    (fun () -> s.compensate r)
+                    (fun _ -> Lwt.return_unit))
+              in
+              Lwt.return (Error exn))
+    in
+    run [] steps
 end
 ```
 
