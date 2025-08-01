@@ -43,13 +43,26 @@ Web 图是互联网的骨架，每个网页是节点，超链接构成边。这�
 
 ### 7.1.1 传统 PageRank 算法回顾
 
-PageRank 将 Web 建模为马尔可夫链，其核心思想是"被重要页面链接的页面也重要"。传统算法使用幂迭代法：
+PageRank 将 Web 建模为马尔可夫链，其核心思想是"被重要页面链接的页面也重要"。这个优雅的递归定义捕捉了 Web 的本质：权威性通过超链接传递。传统算法使用幂迭代法：
 
 ```
 PR(p) = (1-d)/N + d × Σ(PR(q)/C(q))
 ```
 
-其中 d 是阻尼因子（通常为 0.85），N 是总页面数，C(q) 是页面 q 的出链数。在 OCaml 中，我们定义接口：
+其中 d 是阻尼因子（通常为 0.85），N 是总页面数，C(q) 是页面 q 的出链数。这个公式背后有深刻的数学含义：
+
+**随机游走模型**：
+- 用户以概率 d 点击当前页面的链接
+- 以概率 (1-d) 跳转到随机页面（解决悬空节点问题）
+- PageRank 值是用户访问该页面的稳态概率
+
+**矩阵形式**：
+```
+PR = (1-d)/N × e + d × M^T × PR
+```
+其中 M 是列随机矩阵，e 是全 1 向量。这实际上是求解特征值问题：找到 Google 矩阵 G = (1-d)/N × ee^T + d × M^T 的主特征向量。
+
+在 OCaml 中，我们定义接口：
 
 ```ocaml
 module type PAGERANK = sig
@@ -57,32 +70,95 @@ module type PAGERANK = sig
   type score = float
   type graph
   
+  (* 基础计算接口 *)
   val compute : 
     graph -> 
     damping:float -> 
     iterations:int -> 
     (node_id * score) list
     
+  (* 收敛判断 *)
   val converged : 
     old_scores:(node_id * score) list -> 
     new_scores:(node_id * score) list -> 
     epsilon:float -> 
     bool
+    
+  (* 高级特性 *)
+  val personalized : 
+    graph ->
+    preference_vector:(node_id * float) list ->
+    damping:float ->
+    (node_id * score) list
+    
+  val topic_sensitive :
+    graph ->
+    topic_vectors:(string * (node_id * float) list) list ->
+    damping:float ->
+    string -> (* topic *)
+    (node_id * score) list
 end
 ```
 
+**算法优化技巧**：
+1. **稀疏矩阵优化**：只存储非零元素，跳过零乘法
+2. **Block-Stripe 更新**：将节点分块，提高缓存利用率
+3. **异步迭代**：Gauss-Seidel 风格的更新
+4. **自适应计算**：重要节点更频繁更新
+
 ### 7.1.2 增量计算的设计动机
 
-Web 图每天都在变化：新页面出现、旧页面消失、链接结构调整。完全重算 PageRank 需要处理整个图，对于十亿级节点来说成本高昂。增量计算的核心挑战：
+Web 图每天都在变化：新页面出现、旧页面消失、链接结构调整。完全重算 PageRank 需要处理整个图，对于十亿级节点来说成本高昂。让我们量化这个挑战：
+
+**变化规模**：
+- 每日新增页面：~10 亿
+- 每日消失页面：~5 亿  
+- 链接结构变化：~100 亿条边
+- 完全重算耗时：10+ 小时（千台机器）
+
+**增量计算的核心挑战**：
 
 1. **局部性原理**：链接变化的影响能否限制在局部？
+   - 理论：PageRank 的变化随距离指数衰减
+   - 实践：高权重节点的变化可能影响全局
+   - 权衡：精度 vs. 计算范围
+
 2. **收敛速度**：如何快速传播变化的影响？
+   - 优先级传播：重要变化先处理
+   - 并行化：不同区域独立更新
+   - 近似算法：Monte Carlo 采样
+
 3. **一致性保证**：增量结果与全量计算的误差控制
+   - 数学证明：误差上界 ε < δ × d^k
+   - 工程实践：定期全量计算校准
+   - 监控机制：追踪累积误差
+
 4. **资源权衡**：计算、存储、通信的平衡
+   - 存储历史状态 vs. 重算开销
+   - 细粒度更新 vs. 批量处理
+   - 精确计算 vs. 近似算法
+
+**现实约束**：
+```ocaml
+type system_constraints = {
+  latency_sla: float;           (* 99% 更新延迟 < 1 小时 *)
+  accuracy_requirement: float;   (* 误差 < 1% *)
+  resource_budget: {
+    cpu_hours: int;
+    memory_gb: int;
+    network_bandwidth_gbps: float;
+  };
+  freshness_requirement: {
+    critical_pages: duration;    (* < 10 分钟 *)
+    normal_pages: duration;      (* < 1 小时 *)
+    long_tail: duration;         (* < 24 小时 *)
+  };
+}
+```
 
 ### 7.1.3 Delta-based 更新策略
 
-增量 PageRank 的核心是追踪变化（delta）并高效传播。设计要点：
+增量 PageRank 的核心是追踪变化（delta）并高效传播。关键洞察：PageRank 的线性特性允许我们分解计算。
 
 ```ocaml
 module type INCREMENTAL_PAGERANK = sig
@@ -97,6 +173,16 @@ module type INCREMENTAL_PAGERANK = sig
     | Synchronous of { batch_size: int }
     | Asynchronous of { priority_queue: bool }
     | Adaptive of { threshold: float }
+    
+  (* 变化影响估计 *)
+  type impact_estimation = {
+    affected_nodes: node_id list;
+    impact_scores: (node_id * float) list;
+    propagation_depth: int;
+  }
+  
+  val estimate_impact :
+    graph -> delta -> impact_estimation
   
   val update : 
     current_scores:(node_id * score) list ->
@@ -107,36 +193,237 @@ module type INCREMENTAL_PAGERANK = sig
 end
 ```
 
+**数学基础**：
+增量更新基于 PageRank 的线性性质：
+```
+PR_new = PR_old + ΔPR
+ΔPR = d × ΔM^T × PR_old + d × M^T × ΔPR
+```
+
+这给出迭代公式：
+```
+ΔPR^(k+1) = d × (ΔM^T × PR_old + M^T × ΔPR^(k))
+```
+
 **影响传播模型**：
-- **前向传播**：当节点 PR 值变化时，影响其所有出链节点
-- **反向追踪**：找出所有影响当前节点的入链
-- **优先级调度**：变化大的节点优先处理
+
+1. **前向传播**：当节点 PR 值变化时，影响其所有出链节点
+   ```ocaml
+   type forward_propagation = {
+     source_change: node_id * float;
+     wave_front: (node_id * float * int) Queue.t; (* node, delta, depth *)
+     damping_per_hop: float;
+   }
+   ```
+
+2. **反向追踪**：找出所有影响当前节点的入链
+   ```ocaml
+   type backward_trace = {
+     target_node: node_id;
+     influence_paths: (node_id list * float) list; (* path, influence *)
+     cutoff_threshold: float;
+   }
+   ```
+
+3. **优先级调度**：变化大的节点优先处理
+   ```ocaml
+   type priority_scheduler = {
+     queue: (float * node_id) Heap.t; (* priority, node *)
+     processed: node_id Set.t;
+     batch_mode: [`Individual | `Batch of int];
+   }
+   ```
 
 **近似算法选择**：
+
 1. **Monte Carlo 方法**：随机游走采样估计 PR 变化
+   - 优点：内存效率高，可并行
+   - 缺点：方差大，需要多次采样
+   - 适用：大规模图的快速估计
+
 2. **局部迭代**：只在受影响子图上运行幂迭代
+   - 优点：精度可控，收敛保证
+   - 缺点：需要识别影响边界
+   - 适用：局部变化的精确计算
+
 3. **增量矩阵运算**：利用 Sherman-Morrison 公式更新
+   - 优点：数学优雅，理论完备
+   - 缺点：数值稳定性挑战
+   - 适用：小规模变化的精确更新
+
+**工程实现考虑**：
+```ocaml
+type implementation_strategy = {
+  (* 变化检测 *)
+  change_detection: [`Diff | `Checksum | `Timestamp];
+  
+  (* 批处理策略 *)
+  batching: {
+    time_window: duration;
+    size_threshold: int;
+    urgency_override: node_id -> bool;
+  };
+  
+  (* 并行化 *)
+  parallelism: {
+    partition_strategy: [`Geographic | `Temporal | `Random];
+    conflict_resolution: [`LastWrite | `Merge | `Coordinate];
+  };
+  
+  (* 容错机制 *)
+  fault_tolerance: {
+    checkpoint_interval: duration;
+    recovery_strategy: [`Replay | `Recompute | `Approximate];
+  };
+}
+```
 
 ### 7.1.4 收敛性保证与优化
 
-增量计算的正确性依赖于收敛性分析：
+增量计算的正确性依赖于收敛性分析。我们需要在数学严谨性和工程实用性之间找到平衡。
 
 **理论保证**：
-- **误差界**：|PR_incremental - PR_full| < ε
-- **收敛条件**：谱半径 < 1 确保迭代收敛
-- **稳定性**：小扰动导致小变化（Lipschitz 连续性）
 
-**工程优化**：
-1. **异步更新**：不等待全局同步，提高吞吐量
-2. **自适应阈值**：根据节点重要性调整收敛标准
-3. **检查点机制**：定期全量计算校正累积误差
-4. **并行调度**：基于图着色的无冲突并行更新
+1. **误差界分析**：
+   ```
+   定理：对于增量 PageRank，误差界为：
+   |PR_incremental - PR_full| ≤ ε × d^k / (1-d)
+   
+   其中：
+   - ε：初始扰动大小
+   - d：阻尼因子（0.85）
+   - k：传播步数
+   ```
+
+2. **收敛条件**：
+   - **谱半径**：Google 矩阵的谱半径 ρ(G) = d < 1
+   - **收缩映射**：‖G^k‖ ≤ d^k → 0 as k → ∞
+   - **Perron-Frobenius**：保证唯一正特征向量存在
+
+3. **稳定性分析**：
+   ```ocaml
+   type stability_analysis = {
+     lipschitz_constant: float;    (* L = d/(1-d) *)
+     condition_number: float;       (* κ(G) *)
+     sensitivity: node_id -> float; (* ∂PR/∂edge *)
+   }
+   ```
+
+**算法优化技术**：
+
+1. **异步更新架构**：
+   ```ocaml
+   module type ASYNC_PAGERANK = sig
+     type update_order =
+       | RoundRobin
+       | Priority of (node_id -> float)
+       | Adaptive of {
+           staleness_penalty: int -> float;
+           importance_score: node_id -> float;
+         }
+     
+     val update_async :
+       graph ->
+       current_pr:score array ->
+       order:update_order ->
+       convergence_check:(score array -> bool) ->
+       score array
+   end
+   ```
+
+2. **自适应收敛标准**：
+   ```ocaml
+   type adaptive_convergence = {
+     (* 分层收敛标准 *)
+     tier_thresholds: [
+       | `Critical of float     (* 1e-6 for top 1% nodes *)
+       | `Important of float    (* 1e-4 for top 10% *)
+       | `Normal of float       (* 1e-3 for others *)
+       | `LongTail of float     (* 1e-2 for rarely accessed *)
+     ];
+     
+     (* 动态调整 *)
+     adjust_strategy: {
+       based_on_access_frequency: bool;
+       based_on_pr_magnitude: bool;
+       based_on_change_rate: bool;
+     };
+   }
+   ```
+
+3. **检查点与恢复**：
+   ```ocaml
+   type checkpoint_strategy = {
+     (* 全量检查点 *)
+     full_checkpoint: {
+       interval: duration;
+       storage: [`Memory | `Disk | `Distributed];
+       compression: [`None | `Snappy | `Zstd];
+     };
+     
+     (* 增量检查点 *)
+     incremental: {
+       change_log_size: int;
+       compact_threshold: float;
+     };
+     
+     (* 误差校正 *)
+     error_correction: {
+       cumulative_error_threshold: float;
+       correction_method: [`FullRecompute | `LocalRefine];
+     };
+   }
+   ```
+
+4. **并行调度优化**：
+   ```ocaml
+   type parallel_schedule = {
+     (* 图着色 *)
+     coloring: {
+       algorithm: [`Greedy | `Spectral | `Distributed];
+       max_colors: int;
+       conflict_resolution: [`Recolor | `Serialize];
+     };
+     
+     (* 工作窃取 *)
+     work_stealing: {
+       granularity: int;  (* nodes per task *)
+       steal_policy: [`Random | `Nearest | `LeastLoaded];
+     };
+     
+     (* NUMA 感知 *)
+     numa_aware: {
+       node_placement: node_id -> numa_node;
+       memory_affinity: bool;
+     };
+   }
+   ```
+
+**高级优化策略**：
+
+1. **机器学习加速**：
+   - 使用 GNN 预测 PR 变化模式
+   - 学习最优更新顺序
+   - 自适应调整算法参数
+
+2. **硬件加速**：
+   - GPU 上的稀疏矩阵运算
+   - FPGA 实现的定制数据路径
+   - 利用 AVX-512 的向量化
+
+3. **近似算法**：
+   - Top-k PageRank：只计算最重要的 k 个节点
+   - Sketch-based：使用概率数据结构
+   - Sampling：基于重要性采样的 Monte Carlo
 
 **扩展研究方向**：
-- **个性化 PageRank**：支持用户偏好的增量计算
+
+- **个性化 PageRank**：支持百万用户偏好的增量计算
 - **时序 PageRank**：考虑链接时间戳的动态排名
-- **多跳邻居缓存**：加速随机游走的局部计算
+- **多跳邻居缓存**：利用图的局部性加速计算
 - **神经 PageRank**：用 GNN 学习传播模式
+- **量子 PageRank**：利用量子计算的并行性
+- **联邦 PageRank**：分布式环境下的隐私保护计算
 
 ---
 
@@ -144,7 +431,14 @@ end
 
 ### 7.2.1 邻接表 vs. 邻接矩阵
 
-图的存储方式直接影响算法性能。Web 图的特性：稀疏（平均出度约 10）、幂律分布（少数节点有大量链接）、动态变化。
+图的存储方式直接影响算法性能。Web 图的特性决定了存储设计的挑战：
+
+**Web 图的真实特性**：
+- **稀疏性**：平均出度约 10，但方差极大
+- **幂律分布**：1% 的节点拥有 50% 的链接
+- **动态性**：每秒数千个节点/边的变化
+- **局部性**：同域名页面倾向相互链接
+- **时效性**：新闻站点的链接快速变化
 
 **邻接表设计**：
 ```ocaml
@@ -156,20 +450,120 @@ module type ADJACENCY_LIST = sig
     anchor_text: string option;
     timestamp: float;
     weight: float;
+    edge_type: [`Follow | `NoFollow | `Redirect | `Canonical];
+    link_context: [`Navigation | `Content | `Footer | `Sidebar];
   }
   
+  (* 基础操作 *)
   val out_edges : t -> node_id -> (node_id * edge_attrs) list
   val in_edges : t -> node_id -> (node_id * edge_attrs) list
   val add_edge : t -> src:node_id -> dst:node_id -> attrs:edge_attrs -> t
   val remove_edge : t -> src:node_id -> dst:node_id -> t
+  
+  (* 高级特性 *)
+  val degree_distribution : t -> (int * int) list  (* degree, count *)
+  val neighbors_within : t -> node_id -> hops:int -> node_id list
+  val edge_attributes : t -> src:node_id -> dst:node_id -> edge_attrs option
 end
 ```
 
-**权衡分析**：
-- **空间复杂度**：邻接表 O(V+E)，矩阵 O(V²)
-- **访问模式**：邻接表适合遍历邻居，矩阵适合随机访问
-- **更新效率**：邻接表插入 O(1)，矩阵需要重分配
-- **缓存友好性**：矩阵连续存储，邻接表可能跳跃访问
+**存储实现变体**：
+
+1. **数组邻接表**：
+   ```ocaml
+   type array_adj_list = {
+     out_edges: (node_id * edge_attrs) array array;
+     in_edges: (node_id * edge_attrs) array array;
+     node_count: int;
+   }
+   ```
+   - 优点：缓存友好，随机访问快
+   - 缺点：动态调整困难
+
+2. **链表邻接表**：
+   ```ocaml
+   type linked_adj_list = {
+     nodes: (out_list * in_list) array;
+     free_list: edge_node list ref;  (* 内存池 *)
+   }
+   and edge_node = {
+     target: node_id;
+     attrs: edge_attrs;
+     mutable next: edge_node option;
+   }
+   ```
+   - 优点：动态插入删除 O(1)
+   - 缺点：指针跳跃，缓存不友好
+
+3. **混合邻接表**：
+   ```ocaml
+   type hybrid_adj_list = {
+     (* 小度数节点用数组 *)
+     small_degree: (node_id * edge_attrs) array array;
+     small_threshold: int;  (* e.g., degree < 100 *)
+     
+     (* 大度数节点用 B+ 树 *)
+     large_degree: (node_id, edge_btree) Hashtbl.t;
+     
+     (* 超大度数节点用专门结构 *)
+     mega_nodes: (node_id, compressed_edges) Hashtbl.t;
+   }
+   ```
+
+**邻接矩阵变体**：
+
+1. **位图矩阵**（仅存储连接性）：
+   ```ocaml
+   type bitmap_matrix = {
+     bits: bytes;  (* V²/8 bytes *)
+     row_size: int;
+     
+     (* 访问方法 *)
+     get: int -> int -> bool;
+     set: int -> int -> bool -> unit;
+   }
+   ```
+
+2. **分块矩阵**：
+   ```ocaml
+   type block_matrix = {
+     blocks: sparse_block array array;
+     block_size: int;  (* e.g., 64x64 *)
+   }
+   and sparse_block = 
+     | Empty
+     | Dense of float array array
+     | Sparse of (int * int * float) list
+   ```
+
+**权衡分析深入**：
+
+| 特性 | 邻接表 | 邻接矩阵 | CSR/CSC | 混合方案 |
+|------|--------|-----------|---------|----------|
+| 空间复杂度 | O(V+E) | O(V²) | O(V+E) | O(V+E) |
+| 邻居遍历 | O(degree) | O(V) | O(degree) | O(degree) |
+| 边存在查询 | O(degree) | O(1) | O(log degree) | O(1)~O(log degree) |
+| 动态插入 | O(1) | O(1) | O(V+E) | O(1)~O(log degree) |
+| 缓存效率 | 中等 | 高 | 很高 | 高 |
+| 并行友好 | 低 | 高 | 高 | 中等 |
+
+**实际系统考虑**：
+1. **内存层次感知**：
+   - L1 cache: 存储热点节点的度数
+   - L2 cache: 存储常访问的邻接表头
+   - L3 cache: 存储活跃子图
+   - Memory: 完整图结构
+   - SSD: 历史版本和冷数据
+
+2. **NUMA 优化**：
+   - 节点数据本地化
+   - 跨 NUMA 访问最小化
+   - 亲和性调度
+
+3. **压缩技术**：
+   - Delta 编码：存储节点 ID 差值
+   - Variable-byte 编码：小数值用更少字节
+   - Elias-Fano 编码：单调序列压缩
 
 ### 7.2.2 压缩图表示（CSR/CSC）
 
