@@ -20,6 +20,145 @@
 简单部署    独立扩展    高可用性    流量管理    全球分布
 ```
 
+### 16.1.1 规模异质性的设计影响
+
+搜索引擎不同组件的资源需求差异巨大，这直接影响部署策略：
+
+**内存密集型服务**：
+- 倒排索引服务：TB 级内存需求，使用内存映射文件优化
+- 缓存服务：高速内存访问，Redis 集群或 Memcached
+- 向量索引：HNSW 图结构常驻内存，需要高内存带宽
+
+**CPU 密集型服务**：
+- 查询解析：复杂的 NLP 处理，需要高主频 CPU
+- 排序计算：特征提取和模型推理，可能需要 SIMD 指令集
+- 聚合服务：多路归并和统计计算
+
+**I/O 密集型服务**：
+- 爬虫服务：大量并发网络连接，需要高带宽和连接数支持
+- 日志收集：持续的磁盘写入，SSD 优化的实例
+- 文档处理：PDF、图片等富媒体解析
+
+**GPU 加速服务**：
+- 向量嵌入计算：BERT、GPT 等模型推理
+- 图像特征提取：CNN 模型处理
+- 实时语音转文字：RNN/Transformer 模型
+
+### 16.1.2 更新频率差异的架构考虑
+
+不同组件的更新频率决定了部署策略：
+
+**高频更新组件**（分钟级）：
+- 使用蓝绿部署或滚动更新
+- 需要版本化 API 支持向后兼容
+- 实现优雅关闭（graceful shutdown）
+
+**中频更新组件**（小时级）：
+- 模型热加载机制，避免服务重启
+- A/B 测试框架支持多版本并存
+- Shadow traffic 验证新版本
+
+**低频更新组件**（天级）：
+- 维护窗口内批量更新
+- 全量数据迁移和验证
+- 备份恢复演练
+
+### 16.1.3 故障域隔离策略
+
+**Blast Radius 控制**：
+```
+用户请求
+    ↓
+API Gateway (故障域 1)
+    ├→ Query Service (故障域 2)
+    │   ├→ Parser (子域 2.1)
+    │   └→ Rewriter (子域 2.2)
+    ├→ Index Service (故障域 3)
+    │   ├→ Primary (子域 3.1)
+    │   └→ Replica (子域 3.2)
+    └→ Ranking Service (故障域 4)
+        ├→ Feature Service (子域 4.1)
+        └→ Model Service (子域 4.2)
+```
+
+**隔离机制**：
+1. **进程隔离**：不同服务运行在独立进程
+2. **容器隔离**：使用 cgroups 限制资源使用
+3. **虚拟机隔离**：敏感服务使用独立 VM
+4. **可用区隔离**：跨 AZ 部署关键服务
+5. **区域隔离**：多区域主备或主主架构
+
+### 16.1.4 全球分布的延迟优化
+
+**层次化部署架构**：
+```
+Tier 0: 全球中心数据中心（1-2个）
+  - 完整索引和历史数据
+  - 复杂查询处理
+  - 机器学习训练
+
+Tier 1: 区域数据中心（5-10个）
+  - 区域完整索引
+  - 标准查询处理
+  - 模型推理服务
+
+Tier 2: 边缘 PoP（50-100个）
+  - 热门查询缓存
+  - 静态资源
+  - 请求路由
+
+Tier 3: ISP 内嵌缓存（数百个）
+  - 极热查询结果
+  - DNS 解析
+```
+
+**延迟优化技术**：
+- Anycast 路由：用户自动连接最近节点
+- GeoDNS：基于地理位置的 DNS 解析
+- TCP 优化：BBR 拥塞控制、0-RTT 握手
+- HTTP/3 QUIC：减少握手延迟
+
+### 16.1.5 成本优化的架构权衡
+
+**按需付费 vs 预留资源**：
+```
+成本模型 = 预留实例成本 + 按需实例成本 + 数据传输成本 + 存储成本
+
+优化目标：
+minimize(total_cost) 
+subject to:
+  - P99_latency < SLA
+  - availability > 99.9%
+  - peak_capacity > max_expected_load * 1.3
+```
+
+**多云策略**：
+1. **避免厂商锁定**：使用标准化接口（Kubernetes、S3 API）
+2. **成本套利**：不同云厂商的价格差异
+3. **地理覆盖**：利用不同云的区域优势
+4. **合规需求**：某些地区的数据主权要求
+
+### 16.1.6 运维复杂度管理
+
+**GitOps 工作流**：
+```
+代码仓库 → CI Pipeline → 制品仓库 → CD Pipeline → 生产环境
+    ↑                                              ↓
+    └────────── 监控反馈 ←─────────────────────────┘
+```
+
+**基础设施即代码（IaC）**：
+- Terraform：云资源管理
+- Ansible：配置管理
+- Helm：Kubernetes 应用打包
+- Kustomize：环境差异化配置
+
+**可观测性堆栈**：
+- Metrics：Prometheus + Grafana
+- Logging：ELK Stack 或 Loki
+- Tracing：Jaeger 或 Zipkin
+- APM：DataDog 或 New Relic
+
 ## 16.2 微服务拆分的设计原则
 
 ### 16.2.1 服务边界的确定
@@ -86,6 +225,111 @@ end
 - 服务网格：Istio、Linkerd 内置发现
 - 客户端负载均衡：gRPC 内置支持
 
+### 16.2.4 数据一致性设计
+
+微服务架构下的数据一致性是核心挑战：
+
+**Saga 模式实现**：
+```ocaml
+module type DISTRIBUTED_TRANSACTION = sig
+  type transaction_id
+  type step
+  type compensation
+  
+  val begin_transaction : unit → transaction_id
+  val add_step : transaction_id → step → compensation → unit
+  val execute : transaction_id → (unit, error) result Lwt.t
+  val compensate : transaction_id → unit Lwt.t
+end
+```
+
+**事件溯源架构**：
+- 所有状态变更记录为事件
+- 事件存储在不可变日志中
+- 通过重放事件重建状态
+- 支持时间旅行调试
+
+**CQRS 模式应用**：
+```
+写路径：API → Command Service → Event Store → Projection
+读路径：API → Query Service → Read Model
+```
+
+### 16.2.5 服务版本管理
+
+**版本策略**：
+1. **URL 版本化**：`/api/v1/search`、`/api/v2/search`
+2. **Header 版本化**：`API-Version: 2.0`
+3. **内容协商**：`Accept: application/vnd.search.v2+json`
+4. **GraphQL 演进**：字段废弃而非删除
+
+**向后兼容保证**：
+- 新增字段使用 Optional 类型
+- 废弃字段标记但保留
+- 行为变更通过 Feature Flag 控制
+- 双写期间的数据迁移
+
+### 16.2.6 服务通信模式
+
+**同步通信**：
+```ocaml
+module type RPC_CLIENT = sig
+  type request
+  type response
+  type timeout = int
+  
+  val call : 
+    service:string → 
+    method:string → 
+    request → 
+    ?timeout:timeout →
+    (response, error) result Lwt.t
+    
+  val call_with_retry :
+    service:string →
+    method:string →
+    request →
+    ?max_retries:int →
+    ?backoff:float →
+    (response, error) result Lwt.t
+end
+```
+
+**异步通信**：
+- 消息队列：Kafka、RabbitMQ、AWS SQS
+- 发布订阅：Redis Pub/Sub、NATS
+- 事件流：Kafka Streams、Apache Pulsar
+
+**通信模式选择矩阵**：
+```
+需求强一致性 + 低延迟要求 → 同步 RPC
+需求最终一致性 + 高吞吐量 → 异步消息
+需求有序处理 + 持久化 → 事件流
+需求扇出通知 + 解耦 → 发布订阅
+```
+
+### 16.2.7 服务拆分的反模式
+
+**过度拆分**：
+- 症状：服务数量 > 团队人数 × 3
+- 问题：运维负担、调试困难、性能下降
+- 解决：合并相关服务、引入 BFF 层
+
+**分布式单体**：
+- 症状：所有服务必须同时部署
+- 问题：失去微服务灵活性
+- 解决：明确服务边界、解耦部署流程
+
+**共享数据库**：
+- 症状：多个服务访问同一数据库
+- 问题：耦合严重、无法独立演进
+- 解决：数据库拆分、事件驱动同步
+
+**同步调用链过长**：
+- 症状：请求经过 > 5 个服务
+- 问题：延迟累加、故障传播
+- 解决：服务编排、缓存、异步化
+
 ## 16.3 服务网格的应用模式
 
 ### 16.3.1 流量管理
@@ -146,6 +390,207 @@ outlierDetection:
 - 服务依赖拓扑
 - 分布式追踪
 - 断路器状态
+
+**分布式追踪集成**：
+```yaml
+tracing:
+  sampling_rate: 0.1  # 采样 10% 的请求
+  providers:
+    - name: jaeger
+      service: jaeger-collector.istio-system.svc.cluster.local
+      port: 9411
+  custom_tags:
+    user_id:
+      header:
+        name: x-user-id
+    query_type:
+      header:
+        name: x-query-type
+```
+
+**自定义指标**：
+```yaml
+telemetry:
+  metrics:
+    - name: query_latency_by_type
+      dimensions:
+        query_type: request.headers["x-query-type"]
+        cache_hit: response.headers["x-cache-status"] == "HIT"
+      unit: MILLISECONDS
+      value: response.duration
+```
+
+### 16.3.4 安全策略实施
+
+**零信任网络模型**：
+```yaml
+# 默认拒绝所有流量
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+spec:
+  {}
+
+# 明确允许特定服务间通信
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-query-to-index
+spec:
+  selector:
+    matchLabels:
+      app: index-service
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/query-service"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/v1/search"]
+```
+
+**mTLS 配置**：
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT  # 强制使用 mTLS
+```
+
+### 16.3.5 灰度发布策略
+
+**金丝雀发布**：
+```yaml
+# 5% 流量到新版本
+spec:
+  http:
+  - match:
+    - headers:
+        cookie:
+          regex: "^(.*?;)?(canary=true)(;.*)?$"
+    route:
+    - destination:
+        host: search-service
+        subset: v2
+  - route:
+    - destination:
+        host: search-service
+        subset: v1
+      weight: 95
+    - destination:
+        host: search-service
+        subset: v2
+      weight: 5
+```
+
+**蓝绿部署**：
+```yaml
+# 基于 header 的流量切换
+spec:
+  http:
+  - match:
+    - headers:
+        x-version:
+          exact: v2
+    route:
+    - destination:
+        host: search-service
+        subset: green
+  - route:
+    - destination:
+        host: search-service
+        subset: blue
+```
+
+### 16.3.6 服务网格的性能优化
+
+**Sidecar 资源限制**：
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+```
+
+**协议优化**：
+- HTTP/2 多路复用减少连接数
+- gRPC 二进制协议降低序列化开销
+- 连接池配置优化
+
+**缓存策略**：
+```yaml
+# Envoy 本地缓存配置
+http_filters:
+- name: envoy.filters.http.cache
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cache.v3.CacheConfig
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.cache.simple_http_cache.v3.SimpleHttpCacheConfig
+      max_cache_size: 10485760  # 10MB
+```
+
+### 16.3.7 多集群服务网格
+
+**跨集群服务发现**：
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: cross-cluster-search
+spec:
+  hosts:
+  - search.remote.cluster
+  location: MESH_EXTERNAL
+  ports:
+  - number: 443
+    name: https
+    protocol: HTTPS
+  resolution: DNS
+  endpoints:
+  - address: cluster-2-gateway.example.com
+    priority: 0
+    weight: 100
+```
+
+**流量路由策略**：
+- 地理位置感知路由
+- 故障转移到远程集群
+- 负载均衡跨集群
+
+### 16.3.8 服务网格的调试工具
+
+**Envoy Admin API**：
+```bash
+# 查看当前配置
+kubectl exec $POD -c istio-proxy -- curl -s localhost:15000/config_dump
+
+# 查看集群状态
+kubectl exec $POD -c istio-proxy -- curl -s localhost:15000/clusters
+
+# 查看活跃连接
+kubectl exec $POD -c istio-proxy -- curl -s localhost:15000/stats/prometheus | grep http_inbound
+```
+
+**istioctl 诊断**：
+```bash
+# 验证配置
+istioctl analyze
+
+# 代理配置同步状态
+istioctl proxy-status
+
+# 查看路由配置
+istioctl proxy-config routes $POD
+```
 
 ## 16.4 配置管理的最佳实践
 
