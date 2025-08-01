@@ -44,16 +44,57 @@ end
 - 基于空格和标点的简单分割
 - 处理缩写、连字符词汇
 - 识别 URL、邮箱等特殊模式
+- 处理所有格（'s）和缩写（can't → can not）
+- 保留或分解复合词（state-of-the-art）
+
+实现考虑：
+```ocaml
+module type SPACE_DELIMITED_TOKENIZER = sig
+  val handle_apostrophes : bool
+  val split_hyphens : bool  
+  val preserve_urls : bool
+  val expand_contractions : (string * string list) list
+end
+```
 
 **无空格语言**（中文、日文等）：
 - 基于词典的最大匹配算法
+  - 正向最大匹配（FMM）
+  - 逆向最大匹配（BMM）
+  - 双向最大匹配
 - 统计模型（HMM、CRF）
+  - 字标注方法（BMES标注）
+  - 词位标注方法
 - 深度学习模型（BiLSTM-CRF）
+  - 字符级嵌入
+  - 预训练语言模型
+
+词典组织优化：
+```ocaml
+module type DICTIONARY = sig
+  type trie_node
+  val insert : string -> unit
+  val longest_match : string -> int -> (string * int) option
+  val exists : string -> bool
+  val with_frequency : string -> int -> unit
+end
+```
 
 **黏着语言**（土耳其语、芬兰语等）：
 - 形态学分析器
+  - 有限状态转换器（FST）
+  - 两级形态学模型
 - 词干提取与词缀处理
+  - 前缀、中缀、后缀分离
+  - 音变规则处理
 - 复合词分解
+  - 基于词典的分解
+  - 统计模型预测分解点
+
+**混合策略语言**（日语、韩语）：
+- 多种文字系统共存（汉字、假名、韩文）
+- 不同文字系统使用不同策略
+- 边界处理的特殊规则
 
 ### 2.1.3 插件系统设计
 
@@ -67,27 +108,130 @@ module type TOKENIZER_PLUGIN = sig
   val process : token list -> token list
   val priority : int  (* 决定插件执行顺序 *)
 end
+
+module type PLUGIN_MANAGER = sig
+  val register : (module TOKENIZER_PLUGIN) -> unit
+  val unregister : string -> unit
+  val get_pipeline : string -> (module TOKENIZER_PLUGIN) list
+  val configure : string -> (string * string) list -> unit
+end
 ```
 
 插件可以实现各种功能：
 - 专有名词识别
+  - 人名、地名、机构名
+  - 领域术语（医学、法律、技术）
+  - 品牌名称保护
 - 数字规范化
+  - 阿拉伯数字与文字互转
+  - 单位统一（1K → 1000）
+  - 日期时间格式化
 - 表情符号处理
+  - Unicode 表情映射到文字
+  - 颜文字识别（^_^）
+  - 自定义表情标记
 - 领域特定术语处理
+  - 化学式分解（H2O → H 2 O）
+  - 编程语言标识符（camelCase → camel Case）
+  - 产品型号保持（iPhone 12 Pro）
+
+**插件组合策略**：
+```ocaml
+module PipelineBuilder = struct
+  type pipeline_config = {
+    plugins: (string * float) list;  (* 插件名和权重 *)
+    conflict_resolution: [`First | `Vote | `Merge];
+    cache_intermediate: bool;
+  }
+  
+  let build config =
+    let plugins = load_plugins config.plugins in
+    fun tokens ->
+      List.fold_left (fun acc plugin ->
+        if should_apply plugin tokens then
+          plugin.process acc
+        else acc
+      ) tokens plugins
+end
+```
 
 ### 2.1.4 性能与准确性权衡
 
 **性能优化策略**：
 1. **预编译模式**：将正则表达式、词典编译成高效数据结构
+   - DFA 编译优化正则匹配
+   - Double-Array Trie 优化词典查找
+   - 内存映射文件减少加载时间
+   
 2. **批处理**：减少函数调用开销
+   - 向量化处理短文本
+   - 批量内存分配
+   - SIMD 指令加速字符处理
+   
 3. **并行处理**：文档级并行、段落级并行
+   - Work-stealing 调度器
+   - 无锁数据结构
+   - GPU 加速深度学习模型
+   
 4. **缓存机制**：常见词汇的分词结果缓存
+   - LRU 缓存高频片段
+   - Bloom Filter 快速判断
+   - 分层缓存（L1/L2/L3）
+
+```ocaml
+module type PERFORMANCE_CONFIG = sig
+  type cache_strategy = 
+    | NoCache
+    | LRU of int
+    | Adaptive of {threshold: float; max_size: int}
+  
+  type parallel_strategy =
+    | Sequential  
+    | ThreadPool of int
+    | WorkStealing
+    | GPU of {device_id: int}
+    
+  val configure : cache_strategy -> parallel_strategy -> unit
+  val profile : ('a -> 'b) -> 'a -> 'b * profile_stats
+end
+```
 
 **准确性考虑**：
 1. **歧义消解**：「研究生命起源」→「研究/生命/起源」vs「研究生/命/起源」
+   - 上下文窗口分析
+   - 词频与互信息统计
+   - 语言模型评分
+   
 2. **新词识别**：社交媒体中的网络新词
+   - 基于统计的新词发现
+   - 社交网络传播分析
+   - 增量学习机制
+   
 3. **多语言混合**：中英混排文本的处理
+   - 字符集检测切换策略
+   - 统一的概率模型
+   - 边界平滑处理
+   
 4. **上下文相关**：同一词在不同上下文中的不同切分方式
+   - 动态规划求解最优路径
+   - Beam Search 保留多个候选
+   - 重排序模型选择最终结果
+
+**权衡决策框架**：
+```ocaml
+module type TRADEOFF_ANALYZER = sig
+  type metrics = {
+    latency_p99: float;
+    throughput: float;
+    accuracy: float;
+    memory_usage: int;
+  }
+  
+  val benchmark : config -> dataset -> metrics
+  val suggest_config : requirements -> config
+  val adaptive_tuning : bool  (* 运行时自动调整 *)
+end
+```
 
 ## 2.2 语言检测模块的架构
 
@@ -128,11 +272,55 @@ end
 - 技术文档中的代码片段
 - 学术论文中的引用
 - 社交媒体中的多语言对话
+- 产品评论中的品牌名称
+- 新闻报道中的原文引用
 
 处理策略：
 1. **滑动窗口检测**：检测文档不同部分的语言
+   ```ocaml
+   module SlidingWindowDetector = struct
+     type window_config = {
+       size: int;           (* 窗口大小 *)
+       stride: int;         (* 滑动步长 *)
+       min_confidence: float;
+       merge_threshold: int; (* 合并相邻同语言段 *)
+     }
+     
+     let detect_segments config text =
+       let windows = generate_windows config text in
+       let raw_detections = List.map detect_window windows in
+       merge_adjacent_segments config raw_detections
+   end
+   ```
+
 2. **层次化检测**：先检测主要语言，再检测局部语言
+   - 文档级检测：确定主要语言
+   - 段落级检测：识别语言切换
+   - 句子级检测：精确定位边界
+   - 词汇级检测：处理混合词汇
+
 3. **上下文增强**：利用周围文本提高检测准确性
+   - 前后文语言概率传播
+   - 主题相关性约束
+   - 文档结构信息利用
+   - 历史检测结果参考
+
+**混合语言建模**：
+```ocaml
+module type MIXED_LANGUAGE_MODEL = sig
+  type language_span = {
+    start: int;
+    end_: int;
+    language: string;
+    confidence: float;
+    context_score: float;  (* 上下文一致性分数 *)
+  }
+  
+  val segment : string -> language_span list
+  val rerank : language_span list -> context -> language_span list
+  val interpolate : language_span list -> smoothed_result
+end
+```
 
 ### 2.2.3 增量语言检测
 
@@ -144,13 +332,59 @@ module type INCREMENTAL_DETECTOR = sig
   val init : unit -> state
   val update : state -> string -> state * detection_result option
   val finalize : state -> detection_result
+  val reset : state -> state  (* 软重置，保留学习信息 *)
+  val checkpoint : state -> checkpoint_data
+  val restore : checkpoint_data -> state
 end
 ```
 
 关键设计点：
 - 最小检测单元：需要多少文本才能可靠检测
+  - 字符级：20-50字符
+  - 词级：5-10个词
+  - 自适应：根据置信度动态调整
+  
 - 状态转换：语言切换的检测
+  - 平滑转换：渐变权重
+  - 硬切换：明确边界
+  - 概率转换：HMM/CRF模型
+  
 - 内存管理：限制状态大小
+  - 循环缓冲区
+  - 指数衰减历史
+  - 重要特征压缩
+
+**流式处理优化**：
+```ocaml
+module StreamingOptimizer = struct
+  type buffer_strategy = 
+    | Fixed of int
+    | Adaptive of {min: int; max: int; target_confidence: float}
+    | Windowed of {size: int; overlap: int}
+    
+  type state = {
+    buffer: CircularBuffer.t;
+    language_probs: (string * float) list;
+    feature_cache: FeatureCache.t;
+    detection_history: detection_result Queue.t;
+  }
+  
+  let should_emit state =
+    let conf = max_confidence state.language_probs in
+    conf > state.config.emit_threshold ||
+    Buffer.length state.buffer > state.config.force_emit_size
+end
+```
+
+**状态持久化设计**：
+```ocaml
+module type PERSISTENT_DETECTOR = sig
+  val save_state : state -> string -> unit
+  val load_state : string -> state option
+  val merge_states : state list -> state
+  val diff_states : state -> state -> state_delta
+end
+```
 
 ### 2.2.4 置信度评估系统
 
@@ -158,14 +392,83 @@ end
 
 **置信度因素**：
 - 文本长度：越长越可靠
+  - 对数增长模型：conf = log(1 + length/baseline)
+  - 饱和模型：conf = 1 - exp(-length/scale)
+  - 分段线性模型
+  
 - 特征明显程度：独特字符集、词汇
+  - Unicode 块分布熵
+  - 语言特定 N-gram 覆盖率
+  - 停用词匹配度
+  - 字符频率分布距离
+  
 - 模型一致性：多个模型的一致程度
+  - 投票一致性分数
+  - 概率分布 KL 散度
+  - 加权集成置信度
+  
 - 歧义程度：相似语言间的区分难度
+  - 语言对混淆矩阵
+  - 特征重叠度量
+  - 历史误分类率
+
+```ocaml
+module ConfidenceCalculator = struct
+  type feature_vector = {
+    text_length: int;
+    unique_chars: int;
+    script_entropy: float;
+    ngram_coverage: float;
+    model_agreement: float;
+  }
+  
+  type calibration_data = {
+    feature_weights: float array;
+    confusion_matrix: (string * string, float) Hashtbl.t;
+    threshold_map: (string, float) Hashtbl.t;
+  }
+  
+  let calculate features calibration =
+    let raw_score = dot_product features calibration.feature_weights in
+    let calibrated = isotonic_regression raw_score calibration in
+    bound 0.0 1.0 calibrated
+    
+  let explain_confidence result =
+    let factors = analyze_contribution result in
+    generate_explanation factors
+end
+```
 
 **应用场景**：
 - 低置信度时的降级策略
+  - 使用多个候选语言索引
+  - 触发人工标注流程
+  - 回退到字符级索引
+  
 - 人工审核触发条件
+  - 置信度低于阈值（如 0.7）
+  - 多个高分候选语言
+  - 检测结果与元数据冲突
+  
 - 索引策略调整
+  - 高置信度：使用语言特定优化
+  - 中置信度：使用通用策略
+  - 低置信度：多策略并行
+
+**置信度校准**：
+```ocaml
+module ConfidenceCalibration = struct
+  type calibration_method = 
+    | Isotonic
+    | Platt
+    | Beta
+    | Histogram of int
+    
+  val calibrate : method -> raw_scores -> labels -> calibrator
+  val evaluate : calibrator -> test_set -> calibration_metrics
+  val online_update : calibrator -> feedback -> calibrator
+end
+```
 
 ## 2.3 文本规范化的设计模式
 
