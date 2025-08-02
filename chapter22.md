@@ -58,12 +58,58 @@ module type EDIT_DISTANCE = sig
 end
 ```
 
+在实际实现中，还需要考虑更复杂的距离度量：
+
+- **Jaro-Winkler 距离**: 对前缀匹配给予更高权重，适合人名和品牌纠错
+- **音似距离（Soundex/Metaphone）**: 处理同音异形词，如 "iPhone" vs "aifone"
+- **视觉相似度**: OCR 场景下的字符相似度，如 "0" vs "O", "1" vs "l"
+- **键盘距离**: 基于键盘布局的误按概率模型
+
 #### 优化策略
 
 1. **前缀树加速**: 使用 Trie 结构存储词典，支持早期剪枝
+   - 分支限界：当前缀的最小可能距离已超过阈值时剪枝
+   - 共享计算：相同前缀的编辑距离可复用
+   - 内存优化：使用 DAWG（Directed Acyclic Word Graph）压缩存储
+
 2. **BK-Tree 索引**: 利用度量空间的三角不等式快速过滤候选词
+   - 构建时间 O(n log n)，查询时间 O(log n) 平均情况
+   - 支持任意满足三角不等式的距离度量
+   - 可以并行构建多个子树提升构建速度
+
 3. **并行计算**: 动态规划矩阵的对角线并行化
+   - GPU 加速：利用 CUDA/OpenCL 并行计算编辑距离矩阵
+   - SIMD 指令：使用向量化指令同时处理多个字符比较
+   - 分块计算：将大矩阵分解为小块，减少 cache miss
+
 4. **近似算法**: 使用 LSH 或 MinHash 进行粗筛
+   - SimHash：将字符串映射到汉明空间，快速计算相似度
+   - MinHash + LSH：处理集合相似度，适合 n-gram 表示
+   - 学习型哈希：使用神经网络学习最优的哈希函数
+
+#### 实时性能优化
+
+在搜索引擎中，拼写纠错必须在毫秒级完成：
+
+```ocaml
+module type SPELL_CHECKER = sig
+  type t
+  type candidate = {
+    word : string;
+    score : float;
+    source : [`Dictionary | `QueryLog | `UserHistory];
+  }
+  
+  val create : config -> dictionary -> t
+  val check : t -> string -> candidate list
+  val check_with_context : t -> string -> context:string list -> candidate list
+  
+  type optimization = 
+    | CachingStrategy of { cache_size : int; eviction : [`LRU | `LFU] }
+    | Precomputation of { common_errors : (string * string) list }
+    | TrigramIndex of { false_positive_rate : float }
+end
+```
 
 ### 1.2 统计语言模型的应用
 
@@ -88,6 +134,71 @@ end
 - **Skip-gram**: 处理非连续依赖
 - **神经语言模型**: 使用 LSTM/Transformer 建模长距离依赖
 
+#### Noisy Channel Model
+
+经典的拼写纠错使用噪声信道模型：
+
+```
+P(correct|observed) ∝ P(observed|correct) × P(correct)
+```
+
+其中：
+- `P(observed|correct)`: 错误模型，可从用户纠错行为学习
+- `P(correct)`: 语言模型，可从大规模语料统计
+
+```ocaml
+module type NOISY_CHANNEL = sig
+  type error_model
+  type language_model
+  
+  val train_error_model : (string * string) list -> error_model
+  val train_language_model : corpus -> language_model
+  
+  val correct : 
+    error_model -> 
+    language_model -> 
+    string -> 
+    (string * float) list
+    
+  type feature = 
+    | EditDistance of float
+    | Phonetic of float  
+    | Keyboard of float
+    | Frequency of float
+    | Context of float
+end
+```
+
+#### 上下文感知纠错
+
+现代搜索引擎的查询纠错必须考虑上下文：
+
+1. **会话上下文**: "买了 ipone" → "iphone"（基于之前搜索 "iPhone 13 价格"）
+2. **地理上下文**: "pikza" → "pizza"（用户在意大利）
+3. **时间上下文**: "kobe" → "covid"（2020年疫情期间）
+4. **领域上下文**: "jave" → "java"（在编程相关搜索中）
+
+#### 混合模型架构
+
+实践中通常组合多种信号：
+
+```ocaml
+module type HYBRID_CORRECTOR = sig
+  type evidence = 
+    | Statistical of { score : float; source : string }
+    | Neural of { score : float; model : string }
+    | Behavioral of { score : float; signal_type : string }
+    
+  type correction = {
+    original : string;
+    candidates : (string * evidence list) list;
+  }
+  
+  val combine_evidences : evidence list -> float
+  val rank_corrections : correction -> (string * float) list
+end
+```
+
 ### 1.3 用户行为驱动的纠错
 
 用户的历史行为提供了宝贵的纠错信号。点击日志中的查询-点击对可以挖掘出高质量的纠错映射。
@@ -95,9 +206,24 @@ end
 #### 行为信号的类型
 
 1. **查询重写序列**: 用户在短时间内的连续查询
+   - 时间窗口：通常 30 秒内的连续查询
+   - 编辑距离：相邻查询的相似度
+   - 结果改善：后续查询是否获得更多点击
+
 2. **点击跳过模式**: 某些结果被系统性跳过
+   - 位置偏差校正：考虑结果展示位置
+   - 群体行为：多用户的一致跳过行为
+   - 时间演化：跳过模式的时间稳定性
+
 3. **停留时间**: 区分好结果和坏结果
+   - 短停留（<10s）：可能表示结果不相关
+   - 长停留（>30s）：用户找到有用信息
+   - 回访行为：是否返回搜索结果页
+
 4. **会话结束信号**: 找到满意结果的标志
+   - 搜索终止：不再继续搜索
+   - 任务完成：后续行为表明任务完成
+   - 满意度信号：显式或隐式的满意度反馈
 
 ```ocaml
 module type BEHAVIOR_MODEL = sig
@@ -115,6 +241,57 @@ module type BEHAVIOR_MODEL = sig
     
   val mine_corrections : query_log -> correction_candidate list
   val validate : correction_candidate -> validation_result
+end
+```
+
+#### 纠错对挖掘算法
+
+从用户行为中挖掘纠错对的关键步骤：
+
+1. **会话分割**: 识别相关的查询序列
+   ```ocaml
+   type session_splitter = {
+     time_threshold : duration;
+     similarity_threshold : float;
+     task_classifier : query list -> task_type option;
+   }
+   ```
+
+2. **候选对生成**: 找出潜在的纠错关系
+   - 连续查询对：(q1, q2) where edit_distance(q1, q2) < threshold
+   - 跳跃查询对：考虑中间有探索性查询的情况
+   - 多跳纠错：q1 → q2 → q3 的传递关系
+
+3. **置信度计算**: 评估纠错对的可靠性
+   ```ocaml
+   type confidence_factors = {
+     frequency : int;           (* 出现次数 *)
+     consistency : float;       (* 不同用户的一致性 *)
+     improvement : float;       (* 结果质量提升 *)
+     bidirectional : bool;      (* 是否存在反向纠错 *)
+   }
+   ```
+
+4. **噪声过滤**: 排除错误的纠错关系
+   - 品牌变体：iPhone vs iPhone 13（不是纠错）
+   - 查询细化：手机 → 华为手机（不是纠错）
+   - 同义变换：汽车 → 轿车（不是纠错）
+
+#### 实时学习架构
+
+用户行为驱动的纠错需要实时更新能力：
+
+```ocaml
+module type ONLINE_LEARNING = sig
+  type model
+  type update = 
+    | NewCorrection of { query : string; correction : string; signal : signal }
+    | Feedback of { correction : string; accepted : bool }
+    
+  val update : model -> update -> model
+  val merge : model list -> model  (* 分布式合并 *)
+  val checkpoint : model -> unit   (* 持久化 *)
+  val rollback : model -> version -> model
 end
 ```
 
@@ -140,17 +317,114 @@ end
 ```
 
 常用的数据结构选择：
-- **Trie + Top-K**: 每个节点存储 Top-K 补全
-- **压缩前缀树**: 减少内存占用
-- **三元搜索树**: 平衡内存和查询效率
-- **前缀哈希表**: 空间换时间的极致
+
+1. **Trie + Top-K**: 每个节点存储 Top-K 补全
+   - 优点：前缀查询 O(m)，m 为前缀长度
+   - 缺点：内存占用大，更新代价高
+   - 优化：只在叶节点存储完整信息
+
+2. **压缩前缀树（Radix Tree）**: 减少内存占用
+   - 路径压缩：单子节点路径合并
+   - 适合稀疏数据和长尾查询
+   - 支持高效的范围查询
+
+3. **三元搜索树（TST）**: 平衡内存和查询效率
+   - 结合 BST 和 Trie 的优点
+   - 内存效率优于 Trie
+   - 支持近似匹配和通配符
+
+4. **前缀哈希表**: 空间换时间的极致
+   - 预计算所有可能前缀的结果
+   - 查询时间 O(1)
+   - 适合有限词表和短前缀
+
+#### 排序与个性化
+
+自动补全的排序需要综合多种信号：
+
+```ocaml
+module type SUGGESTION_RANKER = sig
+  type ranking_features = {
+    query_frequency : float;      (* 全局查询频率 *)
+    user_frequency : float;       (* 用户查询频率 *)
+    temporal_trend : float;       (* 时间趋势分数 *)
+    location_relevance : float;   (* 地理相关性 *)
+    context_similarity : float;   (* 上下文相似度 *)
+    completion_rate : float;      (* 补全选择率 *)
+  }
+  
+  val extract_features : suggestion -> user_context -> ranking_features
+  val rank : suggestion list -> user_context -> suggestion list
+  
+  type personalization_level = 
+    | Global                      (* 无个性化 *)
+    | Cohort of string           (* 群组个性化 *)
+    | User of user_id            (* 用户个性化 *)
+    | Session of session_id      (* 会话个性化 *)
+end
+```
+
+#### 实时性能优化策略
+
+1. **多级缓存架构**:
+   ```ocaml
+   type cache_hierarchy = {
+     browser_cache : { size : int; ttl : duration };
+     edge_cache : { locations : string list; policy : eviction_policy };
+     app_cache : { implementation : [`Redis | `Memcached]; sharding : bool };
+     index_cache : { hot_prefixes : int; bloom_filter : bool };
+   }
+   ```
+
+2. **预测性预取**:
+   - 基于输入速度预测下一个字符
+   - 预取可能的后续前缀结果
+   - 利用键盘布局预测可能的误按
+
+3. **流式处理**:
+   - 支持逐字符流式返回结果
+   - 客户端渐进式渲染
+   - 取消过期的请求
+
+4. **负载均衡**:
+   ```ocaml
+   type load_balancing = 
+     | RoundRobin
+     | LeastConnections
+     | PrefixAffinity of { hash_function : string -> int }
+     | GeoProximity of { user_location : location }
+   ```
 
 #### 分布式架构考虑
 
-1. **分片策略**: 按前缀分片 vs. 一致性哈希
-2. **缓存层次**: 边缘缓存 + 应用缓存 + 索引缓存
-3. **更新机制**: 增量更新 vs. 批量重建
-4. **个性化**: 用户级别 vs. 群组级别 vs. 全局
+1. **分片策略**: 
+   - 前缀分片：相同前缀路由到同一节点
+   - 一致性哈希：支持动态扩缩容
+   - 复合分片：前缀 + 用户 ID 二级分片
+
+2. **数据同步**:
+   ```ocaml
+   module type SYNC_PROTOCOL = sig
+     type sync_method = 
+       | FullSync of { frequency : duration }
+       | IncrementalSync of { batch_size : int; latency : duration }
+       | EventDriven of { stream : event_stream }
+       
+     val sync : source:node -> target:node -> sync_method -> unit
+     val reconcile : node list -> consistency_level -> unit
+   end
+   ```
+
+3. **更新机制**: 
+   - 增量更新：只更新变化的部分
+   - 批量重建：定期完全重建索引
+   - 混合策略：热数据增量，冷数据批量
+
+4. **个性化层次**:
+   - 全局：所有用户共享
+   - 群组：相似用户群体
+   - 用户：个人历史和偏好
+   - 会话：当前会话上下文
 
 ## 2. 基于 BERT 的同义词扩展与意图理解
 
@@ -178,12 +452,105 @@ module type QUERY_ENCODER = sig
 end
 ```
 
+#### 查询特定的模型适配
+
+搜索查询与一般文本有显著差异，需要特殊适配：
+
+1. **查询特征**:
+   - 平均长度短（2-4 个词）
+   - 语法不完整（缺少冠词、介词）
+   - 领域术语多（品牌、型号、专业词汇）
+   - 含有特殊符号（价格、型号中的符号）
+
+2. **预训练策略**:
+   ```ocaml
+   type pretraining_task = 
+     | MaskedQueryModeling of { mask_ratio : float }
+     | QueryNextQuery of { window_size : int }
+     | ClickedDocumentPrediction
+     | QueryIntentClassification
+   ```
+
+3. **领域适应**:
+   - 在查询日志上继续预训练
+   - 使用点击数据作为弱监督信号
+   - 结合知识图谱增强实体理解
+
 #### 推理优化策略
 
-1. **模型蒸馏**: 将 BERT-Large 蒸馏到 6 层小模型
-2. **量化技术**: INT8 量化减少内存和计算
-3. **剪枝策略**: 移除冗余的注意力头
-4. **动态计算**: 根据查询复杂度调整计算深度
+1. **模型蒸馏**: 
+   ```ocaml
+   module type DISTILLATION = sig
+     type teacher_model
+     type student_model
+     
+     val distill : 
+       teacher:teacher_model -> 
+       architecture:model_architecture ->
+       training_data:dataset ->
+       student_model
+       
+     type distillation_loss = 
+       | KLDivergence of { temperature : float }
+       | MSE of { layer_mapping : (int * int) list }
+       | Attention of { head_mapping : bool }
+       | Combined of (distillation_loss * float) list
+   end
+   ```
+
+2. **量化技术**: 
+   - INT8 量化：精度损失小，速度提升 2-4x
+   - 混合精度：关键层保持 FP16，其他层 INT8
+   - 动态量化：根据输入范围动态调整量化参数
+
+3. **剪枝策略**: 
+   - 结构化剪枝：移除整个注意力头或层
+   - 非结构化剪枝：移除权重矩阵中的元素
+   - 任务相关剪枝：保留对查询理解重要的部分
+
+4. **动态计算**: 
+   ```ocaml
+   type dynamic_inference = {
+     early_exit : float -> bool;  (* 置信度阈值 *)
+     layer_skip : query -> int list;  (* 跳过的层 *)
+     adaptive_length : string -> int;  (* 动态序列长度 *)
+   }
+   ```
+
+#### 缓存与服务化
+
+为了支持大规模在线服务，需要精心设计缓存和服务架构：
+
+```ocaml
+module type MODEL_SERVER = sig
+  type server
+  type request = {
+    queries : string array;
+    model_version : string option;
+    timeout : duration;
+  }
+  
+  type response = {
+    embeddings : encoding array;
+    latency : duration;
+    cache_hit : bool array;
+  }
+  
+  val serve : server -> request -> response Lwt.t
+  
+  type cache_config = {
+    embedding_cache : {
+      size : int;
+      ttl : duration;
+      similarity_threshold : float;  (* 近似匹配 *)
+    };
+    model_cache : {
+      versions : int;  (* 同时缓存的模型版本数 *)
+      preload : bool;  (* 预加载到 GPU *)
+    };
+  }
+end
+```
 
 ### 2.2 同义词挖掘与扩展策略
 
