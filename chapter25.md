@@ -39,34 +39,699 @@
 - 2.4 偏差感知的训练策略
 
 ### 3. 跨设备与会话感知的用户建模
-- 3.1 跨设备用户识别架构
-  - 确定性匹配策略
-  - 概率性用户链接
-  - 隐私保护的设备关联
-- 3.2 会话建模与表示学习
-  - Session-based Recommendation
-  - Hierarchical RNN架构
-  - Self-Attention会话编码
-- 3.3 长短期兴趣建模
-  - 用户画像的增量更新
-  - 兴趣漂移检测
-  - 多粒度时间建模
-- 3.4 跨设备行为融合策略
 
-### 4. 反事实学习与无偏排序优化
-- 4.1 因果推断框架
-  - Potential Outcome Framework
-  - 反事实推理在搜索中的应用
-  - Treatment Effect估计
-- 4.2 无偏学习排序算法
-  - Unbiased Learning to Rank
-  - Counterfactual Risk Minimization
-  - 偏差-方差权衡
-- 4.3 在线学习与探索策略
-  - Contextual Bandits
-  - Thompson Sampling
-  - 探索-利用平衡
-- 4.4 离线评估与在线实验设计
+现代用户在多个设备间切换搜索，其行为模式呈现复杂的时空特征。构建统一的用户表示需要解决设备识别、会话理解和兴趣演化等挑战。
+
+### 3.1 跨设备用户识别架构
+
+跨设备用户识别是理解用户完整搜索旅程的基础。这涉及在保护隐私的前提下，准确关联来自不同设备的用户行为。
+
+#### 确定性匹配策略
+基于明确信号的用户关联：
+
+```ocaml
+module type DeterministicMatching = sig
+  type user_id = string
+  type device_id = string
+  type matching_signal = 
+    | LoginID of user_id
+    | EmailHash of string
+    | PhoneHash of string
+    | CrossDeviceToken of string
+  
+  val match_devices : matching_signal list -> device_id list -> user_id option
+  val confidence_score : matching_signal -> float
+  val signal_freshness : matching_signal -> timestamp -> float
+end
+```
+
+匹配信号优先级：
+- 登录账号（最可靠）
+- 加密的邮箱/电话（中等可靠）
+- 跨设备同步令牌（需验证）
+- 行为模式相似度（辅助信号）
+
+#### 概率性用户链接
+当缺乏确定性信号时，使用概率模型推断设备关联：
+
+行为特征提取：
+- 搜索查询模式（主题分布、时间模式）
+- 点击偏好（域名、内容类型）
+- 地理位置轨迹（隐私安全处理后）
+- 设备切换时间窗口
+
+```ocaml
+module type ProbabilisticLinking = sig
+  type behavior_embedding = float array
+  type device_pair = device_id * device_id
+  
+  val extract_behavior_features : device_history -> behavior_embedding
+  val similarity_computation : behavior_embedding -> behavior_embedding -> float
+  val graph_clustering : (device_pair * float) list -> device_cluster list
+  val merge_threshold : float  (* 通常设为 0.8-0.9 *)
+end
+```
+
+概率推断架构：
+- 设备相似度计算（余弦相似度、编辑距离）
+- 图聚类算法（Connected Components, Louvain）
+- 时间衰减因子（近期行为权重更高）
+- 不确定性量化（输出概率而非二元决策）
+
+#### 隐私保护的设备关联
+隐私合规是跨设备追踪的核心约束：
+
+技术方案：
+- 差分隐私添加噪声
+- 联邦学习避免原始数据传输
+- 同态加密计算相似度
+- k-匿名性保证
+
+```ocaml
+module type PrivacyPreservingLinking = sig
+  type privacy_budget = float
+  type encrypted_features
+  
+  val add_laplace_noise : features -> privacy_budget -> noisy_features
+  val federated_similarity : local_model list -> global_similarity_model
+  val homomorphic_distance : encrypted_features -> encrypted_features -> encrypted_distance
+  val k_anonymity_check : user_cluster -> int -> bool
+end
+```
+
+实施要点：
+- GDPR/CCPA 合规性审查
+- 用户明确同意机制
+- 数据最小化原则
+- 定期数据清理策略
+
+### 3.2 会话建模与表示学习
+
+会话是用户搜索意图的自然单元，准确理解会话内的行为序列对个性化至关重要。
+
+#### Session-based Recommendation
+会话推荐系统的核心是捕捉短期行为模式：
+
+会话定义策略：
+- 时间间隔分割（如30分钟无活动）
+- 查询相似度分割（主题突变）
+- 混合分割（时间+语义）
+
+```ocaml
+module type SessionModeling = sig
+  type session = {
+    session_id : string;
+    queries : query list;
+    clicks : (query * document * timestamp) list;
+    duration : time_span;
+    device_type : device_type;
+  }
+  
+  val segment_sessions : user_log -> session list
+  val extract_session_intent : session -> intent_distribution
+  val session_embedding : session -> embedding
+end
+```
+
+#### Hierarchical RNN架构
+层次化建模捕捉会话内和会话间的依赖：
+
+架构设计：
+- 底层 RNN：编码会话内查询序列
+- 顶层 RNN：建模会话序列演化
+- 注意力机制：识别关键查询和转折点
+
+```ocaml
+module type HierarchicalRNN = sig
+  type intra_session_state
+  type inter_session_state
+  
+  val encode_query_sequence : query list -> intra_session_state
+  val encode_session_sequence : session list -> inter_session_state
+  val attention_weights : state -> query -> float array
+  val predict_next_query : inter_session_state -> query_distribution
+end
+```
+
+实现优化：
+- LSTM/GRU 缓解梯度问题
+- 截断反向传播控制内存
+- 批处理变长序列
+- 模型压缩部署移动端
+
+#### Self-Attention会话编码
+Transformer 架构在会话建模中的应用：
+
+优势：
+- 并行计算效率高
+- 长距离依赖建模
+- 位置编码保留时序信息
+- 多头注意力捕捉不同关系
+
+```ocaml
+module type SessionTransformer = sig
+  type attention_config = {
+    num_heads : int;
+    hidden_dim : int;
+    position_encoding : position_encoding_type;
+    max_sequence_length : int;
+  }
+  
+  val self_attention : query_sequence -> attention_config -> attended_representation
+  val cross_session_attention : session list -> global_context
+  val masked_prediction : partial_session -> query_distribution
+end
+```
+
+架构变体：
+- BERT-style：双向编码理解上下文
+- GPT-style：自回归生成预测下一查询
+- Hybrid：结合双向理解和单向预测
+
+### 3.3 长短期兴趣建模
+
+用户兴趣具有多时间尺度特征，需要区分稳定偏好和临时需求。
+
+#### 用户画像的增量更新
+实时维护用户兴趣表示：
+
+```ocaml
+module type UserProfileUpdate = sig
+  type interest_profile = {
+    short_term : weighted_topics;  (* 最近1天 *)
+    medium_term : weighted_topics; (* 最近1周 *)
+    long_term : weighted_topics;   (* 历史累积 *)
+  }
+  
+  val incremental_update : interest_profile -> new_interaction -> interest_profile
+  val decay_function : timestamp -> timestamp -> float
+  val merge_profiles : interest_profile list -> interest_profile
+end
+```
+
+更新策略：
+- 指数衰减降低历史权重
+- 主题层次化聚合
+- 异常检测过滤噪声
+- 定期重算防止漂移
+
+#### 兴趣漂移检测
+识别用户兴趣的显著变化：
+
+检测方法：
+- 分布距离度量（KL散度、JS散度）
+- 变点检测算法（CUSUM、贝叶斯方法）
+- 时间序列异常检测
+- 主题演化追踪
+
+```ocaml
+module type InterestDrift = sig
+  type drift_score = float
+  type change_point = timestamp * topic_change
+  
+  val compute_topic_distance : topic_dist -> topic_dist -> drift_score
+  val detect_change_points : topic_sequence -> change_point list
+  val classify_drift_type : change_point -> DriftType.t
+  val adapt_recommendation : drift_score -> recommendation_strategy
+end
+```
+
+应用场景：
+- 生活事件检测（搬家、换工作）
+- 季节性兴趣变化
+- 探索新领域识别
+- 推荐策略自适应
+
+#### 多粒度时间建模
+不同时间尺度的兴趣表示：
+
+```ocaml
+module type MultiGranularityModeling = sig
+  type time_granularity = Hour | Day | Week | Month | Year
+  
+  type temporal_profile = {
+    hourly_pattern : activity_distribution;    (* 日内模式 *)
+    weekly_pattern : day_preference array;     (* 周模式 *)
+    seasonal_trend : season_interests;         (* 季节趋势 *)
+    life_stage : life_stage_interests;         (* 生命阶段 *)
+  }
+  
+  val extract_temporal_patterns : user_history -> temporal_profile
+  val time_aware_scoring : temporal_profile -> timestamp -> score_modifier
+end
+```
+
+时间特征工程：
+- 周期性模式提取（傅里叶变换）
+- 节假日效应建模
+- 工作日/周末区分
+- 时区感知处理
+
+### 3.4 跨设备行为融合策略
+
+整合多设备数据构建统一用户视图：
+
+#### 设备特征对齐
+不同设备的行为特征标准化：
+
+```ocaml
+module type DeviceAlignment = sig
+  type device_features = {
+    screen_size : dimensions;
+    input_method : InputType.t;
+    network_speed : bandwidth;
+    typical_session_length : duration;
+  }
+  
+  val normalize_click_behavior : device_features -> raw_clicks -> normalized_clicks
+  val adjust_dwell_time : device_features -> raw_dwell -> adjusted_dwell
+  val calibrate_scroll_depth : device_features -> scroll_data -> normalized_scroll
+end
+```
+
+对齐策略：
+- 移动设备点击率通常更高
+- 桌面设备停留时间更长
+- 平板介于两者之间
+- 语音设备交互模式特殊
+
+#### 多设备会话拼接
+识别跨设备的连续搜索任务：
+
+拼接信号：
+- 时间邻近性（设备切换时间窗口）
+- 查询相似性（编辑距离、语义相似）
+- 结果重叠度（共同点击文档）
+- 地理位置连续性
+
+```ocaml
+module type CrossDeviceSession = sig
+  type device_session = device_id * session
+  type unified_session = {
+    sessions : device_session list;
+    transition_points : (timestamp * device_id * device_id) list;
+    task_completion : completion_status;
+  }
+  
+  val stitch_sessions : device_session list -> unified_session list
+  val compute_transition_probability : session -> session -> float
+  val extract_cross_device_patterns : unified_session list -> pattern list
+end
+```
+
+#### 统一用户表示学习
+融合多设备数据的深度学习架构：
+
+```ocaml
+module type UnifiedUserEmbedding = sig
+  type device_embedding = embedding
+  type user_embedding = embedding
+  
+  type fusion_architecture = 
+    | Concatenation
+    | Attention_Pooling
+    | Graph_Neural_Network
+    | Hierarchical_Fusion
+  
+  val encode_device_behavior : device_history -> device_embedding
+  val fuse_device_embeddings : device_embedding list -> fusion_architecture -> user_embedding
+  val contrastive_learning : positive_pairs -> negative_pairs -> loss
+end
+```
+
+融合策略比较：
+- 简单拼接：快速但忽略设备间关系
+- 注意力池化：自适应权重组合
+- 图神经网络：建模设备交互拓扑
+- 层次化融合：保留设备特定和共享特征
+
+训练目标：
+- 设备间行为一致性
+- 任务完成度预测
+- 下一设备预测
+- 跨设备查询推荐
+
+## 4. 反事实学习与无偏排序优化
+
+搜索系统的核心挑战是从有偏的用户反馈中学习无偏的排序策略。反事实学习提供了一个原则性的框架，使我们能够回答"如果展示了不同的结果会怎样"这一关键问题。
+
+### 4.1 因果推断框架
+
+在搜索场景中应用因果推断需要仔细定义处理（treatment）、结果（outcome）和混杂因素（confounders）。
+
+#### Potential Outcome Framework
+潜在结果框架是理解反事实推理的基础：
+
+```ocaml
+module type PotentialOutcome = sig
+  type treatment = ranking
+  type outcome = click list
+  type unit = query * user_context
+  
+  (* Y(1) - 展示排序1时的潜在点击 *)
+  (* Y(0) - 展示排序0时的潜在点击 *)
+  type potential_outcomes = {
+    factual : outcome;      (* 观察到的结果 *)
+    counterfactual : outcome option;  (* 未观察到的结果 *)
+  }
+  
+  val causal_effect : potential_outcomes -> treatment_effect
+  val fundamental_problem : unit -> (* 只能观察一个结果 *)
+end
+```
+
+核心假设：
+- SUTVA（稳定单元处理值假设）：用户之间无干扰
+- 一致性：相同处理产生相同结果
+- 可忽略性：给定特征，处理分配独立于潜在结果
+
+#### 反事实推理在搜索中的应用
+搜索场景的特殊性：
+
+处理定义：
+- 文档的排序位置
+- 是否展示某个结果
+- 结果的呈现方式
+
+结果定义：
+- 点击行为
+- 停留时间
+- 查询重写
+- 会话结束
+
+```ocaml
+module type SearchCausality = sig
+  type search_treatment = {
+    ranking : document list;
+    presentation : display_format;
+    position : int;
+  }
+  
+  type search_outcome = {
+    clicks : click list;
+    dwell_time : duration;
+    satisfaction : satisfaction_signal option;
+  }
+  
+  val estimate_position_effect : document -> position -> position -> effect_size
+  val presentation_effect : display_format -> display_format -> effect_size
+end
+```
+
+混杂因素识别：
+- 查询意图（导航/信息/交易）
+- 用户历史偏好
+- 时间上下文
+- 设备类型
+
+#### Treatment Effect估计
+估计展示不同结果的因果效应：
+
+平均处理效应（ATE）：
+```ocaml
+module type TreatmentEffect = sig
+  type ate = float  (* E[Y(1) - Y(0)] *)
+  type cate = features -> float  (* Conditional ATE *)
+  
+  val estimate_ate : population -> treatment -> control -> ate
+  val heterogeneous_effects : subgroups -> treatment -> cate
+  val individual_treatment_effect : unit -> treatment -> ite
+end
+```
+
+估计方法：
+- 匹配方法（Propensity Score Matching）
+- 加权方法（IPW, AIPW）
+- 回归方法（Meta-learners）
+- 机器学习方法（Causal Forests）
+
+实践考虑：
+- 协变量平衡检查
+- 敏感性分析
+- 置信区间计算
+- 多重检验校正
+
+### 4.2 无偏学习排序算法
+
+从有偏的点击数据中学习无偏的排序函数是现代搜索引擎的核心技术。
+
+#### Unbiased Learning to Rank
+无偏 LTR 的核心思想是校正观察偏差：
+
+```ocaml
+module type UnbiasedLTR = sig
+  type biased_feedback = (query * document * click * position) list
+  type relevance_model
+  type bias_model
+  
+  val joint_optimization : biased_feedback -> (relevance_model * bias_model)
+  val debiased_loss : predictions -> labels -> propensities -> float
+  val variance_regularization : float -> regularized_loss
+end
+```
+
+关键算法：
+- Dual Learning Algorithm：联合学习相关性和偏差
+- EM-based Methods：交替优化两个模型
+- Regression-based Approaches：直接回归建模
+
+实现细节：
+- 梯度裁剪防止数值不稳定
+- 批归一化稳定训练
+- 早停防止过拟合
+- 正则化控制模型复杂度
+
+#### Counterfactual Risk Minimization
+最小化反事实风险的原则性方法：
+
+理论基础：
+```ocaml
+module type CounterfactualRisk = sig
+  type policy = context -> action
+  type logging_policy = policy
+  type target_policy = policy
+  
+  (* 反事实风险 = E_π[loss] *)
+  val counterfactual_risk : target_policy -> logging_policy -> data -> risk
+  val importance_sampling : target_policy -> logging_policy -> weight
+  val clipped_importance_sampling : weight -> clip_threshold -> clipped_weight
+end
+```
+
+优化目标：
+- 经验风险最小化（ERM）的反事实版本
+- 方差正则化项
+- 策略约束（避免极端分布偏移）
+
+算法变体：
+- POEM（Policy Optimizer for Exponential Models）
+- BanditNet（深度学习版本）
+- SNIPS（自归一化重要性采样）
+
+#### 偏差-方差权衡
+无偏估计往往具有高方差，需要仔细权衡：
+
+```ocaml
+module type BiasVarianceTradeoff = sig
+  type estimator
+  type hyperparameter = float
+  
+  val bias : estimator -> ground_truth -> float
+  val variance : estimator -> float
+  val mse : estimator -> ground_truth -> float  (* bias² + variance *)
+  
+  val regularized_estimator : hyperparameter -> estimator
+  val cross_validation : data -> hyperparameter list -> optimal_hyperparameter
+end
+```
+
+权衡策略：
+- Shrinkage：向有偏但低方差估计收缩
+- Clipping：限制重要性权重范围
+- Doubly Robust：结合多个估计器
+- Bootstrap：通过重采样估计不确定性
+
+实践指南：
+- 小数据集倾向保守（接受一定偏差）
+- 大数据集可追求更低偏差
+- 在线系统需要稳定性
+- 定期离线评估真实性能
+
+### 4.3 在线学习与探索策略
+
+在线环境需要平衡探索新排序和利用已知最佳排序。
+
+#### Contextual Bandits
+上下文赌博机框架自然适合搜索排序：
+
+```ocaml
+module type ContextualBandit = sig
+  type context = query_features * user_features
+  type arm = document
+  type reward = click_signal
+  
+  type policy = context -> arm list -> probability_distribution
+  
+  val thompson_sampling : posterior -> policy
+  val ucb_style : confidence_bound -> policy  
+  val epsilon_greedy : epsilon -> random_policy -> greedy_policy -> policy
+end
+```
+
+搜索特定挑战：
+- 组合动作空间（排序而非单个选择）
+- 延迟反馈（满意度信号）
+- 非平稳环境（用户偏好演化）
+- 多目标优化（相关性、多样性、新颖性）
+
+#### Thompson Sampling
+贝叶斯方法优雅处理探索-利用权衡：
+
+实现架构：
+```ocaml
+module type ThompsonSampling = sig
+  type prior_distribution
+  type posterior_distribution
+  
+  val update_posterior : 
+    posterior_distribution -> observation -> posterior_distribution
+  val sample_parameters : posterior_distribution -> model_parameters
+  val compute_ranking : model_parameters -> context -> ranking
+  
+  (* 实践优化 *)
+  val batch_update : posterior_distribution -> observation list -> posterior_distribution
+  val approximate_posterior : exact_posterior -> approximation_method -> approximate_posterior
+end
+```
+
+后验近似方法：
+- 共轭先验（Beta-Bernoulli）
+- Laplace 近似
+- 变分推断
+- MCMC 采样
+
+实践优化：
+- 批量更新减少计算
+- 分布式后验维护
+- 在线-离线混合更新
+- 冷启动先验设计
+
+#### 探索-利用平衡
+不同阶段需要不同的探索策略：
+
+```ocaml
+module type ExplorationSchedule = sig
+  type exploration_rate = float
+  type time_step = int
+  
+  val constant_exploration : exploration_rate
+  val decay_schedule : initial_rate -> decay_factor -> time_step -> exploration_rate
+  val adaptive_exploration : performance_history -> exploration_rate
+  val contextual_exploration : query_type -> user_segment -> exploration_rate
+end
+```
+
+探索策略设计：
+- 新用户：更多探索了解偏好
+- 老用户：更多利用提供稳定体验
+- 长尾查询：探索发现相关文档
+- 头部查询：利用已验证排序
+
+自适应机制：
+- 根据预测不确定性调整
+- 根据用户反馈质量调整
+- 根据业务指标调整
+- 根据竞争环境调整
+
+### 4.4 离线评估与在线实验设计
+
+可靠的评估体系是反事实学习成功的关键。
+
+#### 离线评估方法
+使用历史数据评估新策略：
+
+```ocaml
+module type OfflineEvaluation = sig
+  type logged_data = (context * action * reward * logging_probability) list
+  type evaluation_policy
+  
+  val ips_estimator : evaluation_policy -> logged_data -> estimated_performance
+  val direct_method : reward_predictor -> evaluation_policy -> logged_data -> estimated_performance
+  val doubly_robust : reward_predictor -> evaluation_policy -> logged_data -> estimated_performance
+  
+  val confidence_interval : estimator -> logged_data -> (lower_bound * upper_bound)
+end
+```
+
+评估指标：
+- CTR@k（前k个结果的点击率）
+- nDCG（归一化折损累积增益）
+- MAP（平均精度均值）
+- 用户满意度代理指标
+
+数据要求：
+- 日志包含展示概率
+- 随机化流量收集
+- 充分的动作覆盖
+- 代表性用户样本
+
+#### 在线实验设计
+A/B 测试的因果推断视角：
+
+```ocaml
+module type OnlineExperiment = sig
+  type experiment_config = {
+    treatment_allocation : allocation_strategy;
+    sample_size : int;
+    duration : time_period;
+    metrics : metric list;
+  }
+  
+  val randomization_unit : UserLevel | QueryLevel | SessionLevel
+  val stratified_randomization : strata -> allocation
+  val sequential_testing : interim_analysis -> continue_or_stop
+  val multiple_testing_correction : p_values -> adjusted_p_values
+end
+```
+
+实验设计原则：
+- 功效分析确定样本量
+- 分层随机化提高精度
+- 序贯测试早期决策
+- 多重比较校正
+
+因果推断增强：
+- 利用协变量提高功效（CUPED）
+- 工具变量处理不依从
+- 中介分析理解机制
+- 异质性效应分析
+
+#### 长期效应评估
+短期指标可能误导长期影响：
+
+```ocaml
+module type LongTermEvaluation = sig
+  type short_term_metric = float
+  type long_term_outcome = float
+  
+  val surrogate_index : short_term_metric list -> predicted_long_term
+  val user_retention_analysis : experiment_data -> retention_curves
+  val ecosystem_effects : treatment -> spillover_effects
+  val novelty_effect_correction : time_series -> corrected_estimate
+end
+```
+
+方法论：
+- 代理指标方法
+- 用户留存分析  
+- 生态系统效应评估
+- 新颖性效应校正
+
+实践建议：
+- 结合多个时间窗口
+- 关注用户细分差异
+- 监控意外副作用
+- 定期回顾长期影响
 
 ### 5. 本章小结
 
