@@ -4,7 +4,7 @@
 
 ## 24.1 召回-粗排-精排-重排的级联架构
 
-多阶段排序系统的核心思想是逐步缩小候选集，在每个阶段使用适合的算法复杂度。典型的四阶段架构包括：
+多阶段排序系统的核心思想是逐步缩小候选集，在每个阶段使用适合的算法复杂度。这种漏斗式架构让我们能够在严格的延迟约束下，对海量文档进行高质量排序。典型的四阶段架构包括：
 
 ### 24.1.1 各阶段的职责与设计原则
 
@@ -13,24 +13,55 @@
 - 方法：倒排索引、向量检索、布尔查询等轻量级方法
 - 设计原则：高召回率优于精确率，避免遗漏相关文档
 - 典型延迟：10-50ms
+- 关键指标：
+  - 召回率 @ k（通常要求 > 90%）
+  - 候选集多样性（避免同质化）
+  - 查询词覆盖率
+
+**多路召回融合**：
+现代系统通常采用多路召回策略，每路负责不同的相关性信号：
+- 词匹配召回：基于倒排索引的精确和模糊匹配
+- 语义召回：基于向量相似度的语义匹配
+- 个性化召回：基于用户历史的协同过滤
+- 热门召回：基于全局流行度的候选
+
+融合策略需要考虑：
+- 去重机制：相同文档的不同召回路径
+- 分数归一化：不同召回源的分数尺度对齐
+- 配额分配：每路召回的文档数量上限
 
 **粗排阶段（Coarse Ranking）**：
 - 目标：将候选集缩减至数百个文档
 - 方法：简单的线性模型或浅层神经网络
 - 设计原则：使用少量高效特征，如 BM25、静态质量分等
 - 典型延迟：5-20ms
+- 架构选择：
+  - 线性模型：logistic regression，计算效率最高
+  - 浅层网络：2-3 层 MLP，表达能力更强
+  - 树模型：GBDT/LightGBM，特征交互能力强
+  - 双塔模型：预计算文档向量，在线只需点积
 
 **精排阶段（Fine Ranking）**：
 - 目标：产生高质量的 Top-K 结果（通常 K=10-100）
 - 方法：复杂的深度学习模型，如 BERT、T5 等
 - 设计原则：使用丰富的语义特征，追求排序精度
 - 典型延迟：20-100ms
+- 模型演进：
+  - 早期：Learning to Rank (LTR) 模型，如 LambdaMART
+  - 中期：深度匹配模型，如 DRMM、KNRM
+  - 现代：预训练语言模型，如 BERT、T5
+  - 前沿：生成式排序模型，如 RankGPT
 
 **重排阶段（Re-ranking）**：
 - 目标：考虑多样性、新鲜度、个性化等业务目标
 - 方法：基于规则或轻量级模型的后处理
 - 设计原则：平衡相关性与其他目标，优化用户体验
 - 典型延迟：1-5ms
+- 优化维度：
+  - 结果多样性：MMR (Maximal Marginal Relevance) 算法
+  - 时效性平衡：boost 最新内容
+  - 站点分散：避免单一来源垄断
+  - 个性化调整：基于用户画像微调
 
 ### 24.1.2 阶段间的数据流与候选集传递
 
@@ -58,6 +89,46 @@ end
 - **元数据传递**：文档 ID、初步分数、计算的中间结果等
 - **批处理优化**：合并多个查询的候选集进行批量计算
 
+**数据流设计模式**：
+
+1. **管道模式（Pipeline）**：
+   - 每个阶段顺序执行
+   - 前一阶段的输出是后一阶段的输入
+   - 适合延迟敏感的在线服务
+
+2. **异步模式（Async）**：
+   - 精排可以异步处理部分结果
+   - 先返回粗排结果，精排完成后更新
+   - 适合对延迟要求极高的场景
+
+3. **并行模式（Parallel）**：
+   - 多路召回并行执行
+   - 不同特征提取并行计算
+   - 需要最终的同步点
+
+**候选集管理策略**：
+
+```ocaml
+module CandidateSet = struct
+  type t = {
+    docs : Document.t array;
+    scores : float array;
+    features : Feature.t list;
+    stage_metadata : (string * string) list;
+  }
+  
+  val truncate : t -> int -> t
+  val merge : t list -> t
+  val sort_by_score : t -> t
+end
+```
+
+关键优化点：
+- 使用数组而非列表，提升缓存局部性
+- 分数和文档分离存储，便于 SIMD 优化
+- 延迟特征计算，按需加载
+- 支持增量式特征更新
+
 ### 24.1.3 降级策略与容错设计
 
 系统必须处理各种异常情况：
@@ -67,15 +138,76 @@ end
 - 精排超时 → 使用粗排结果
 - 设置每阶段的 SLA (Service Level Agreement)
 
+```ocaml
+module DegradationPolicy = struct
+  type action = 
+    | SkipStage of stage_name
+    | ReduceCandidates of int
+    | UseBackupModel of model_id
+    | ReturnPartialResults
+    
+  type trigger = 
+    | LatencyExceeded of Time.span
+    | ErrorRate of float
+    | LoadThreshold of float
+    
+  val decide : trigger -> context -> action
+end
+```
+
 **容量降级**：
 - 动态调整各阶段的候选集大小
 - 高负载时减少精排文档数量
 - 使用断路器模式防止级联故障
 
+降级决策矩阵：
+| 系统负载 | 召回数量 | 粗排数量 | 精排数量 | 模型选择 |
+|---------|---------|---------|---------|----------|
+| 低 (<30%) | 10000 | 1000 | 100 | 完整模型 |
+| 中 (30-70%) | 5000 | 500 | 50 | 完整模型 |
+| 高 (70-90%) | 2000 | 200 | 20 | 轻量模型 |
+| 过载 (>90%) | 1000 | 100 | 10 | 降级模型 |
+
 **模型降级**：
 - 维护多个版本的模型（轻量级备份）
 - A/B 测试新模型时的回滚机制
 - 特征缺失时的 fallback 策略
+
+```ocaml
+module ModelRegistry = struct
+  type model_variant = 
+    | Primary of { version: string; size: int }
+    | Lightweight of { speedup: float; quality_loss: float }
+    | Fallback of { min_features: string list }
+    
+  val select_model : 
+    latency_budget:Time.span -> 
+    available_features:string list ->
+    model_variant
+end
+```
+
+**容错机制设计**：
+
+1. **断路器模式**：
+   - 错误计数超过阈值时自动熔断
+   - 定期尝试恢复（半开状态）
+   - 支持手动强制开关
+
+2. **重试策略**：
+   - 指数退避：1ms → 2ms → 4ms
+   - 最大重试次数：通常 2-3 次
+   - 仅对幂等操作重试
+
+3. **隔离策略**：
+   - 线程池隔离：每个阶段独立线程池
+   - 请求隔离：VIP 请求独立通道
+   - 资源隔离：缓存、内存分区管理
+
+4. **监控告警**：
+   - 实时指标：延迟 P50/P99、错误率
+   - 降级事件：记录触发原因和影响
+   - 自动扩缩容：基于负载预测
 
 ## 24.2 特征工程与跨阶段特征传递
 
@@ -88,24 +220,59 @@ end
 - 文档长度、更新时间
 - 站点权威度
 - 适用阶段：召回、粗排
+- 存储策略：
+  - 直接存储在倒排索引的 payload 中
+  - 使用定点数压缩（如 uint8 映射到 0-1）
+  - 更新频率：每日批量更新
 
 **查询相关特征**（实时计算）：
 - BM25、TF-IDF 分数
 - 查询词覆盖率
 - 短语匹配、近似度
 - 适用阶段：粗排为主
+- 优化技巧：
+  - 使用倒排索引的统计信息加速计算
+  - 预计算查询无关部分（如文档长度归一化因子）
+  - SIMD 指令并行计算多个文档
 
 **深度语义特征**（计算密集）：
 - BERT embedding 相似度
 - 跨注意力分数
 - 上下文相关性
 - 适用阶段：精排
+- 计算优化：
+  - 批量推理减少开销
+  - 模型量化（FP16/INT8）
+  - 使用 TensorRT 等推理加速库
+  - 文档端 embedding 预计算
 
 **交互特征**（用户相关）：
 - 点击历史、停留时间
 - 个性化偏好
 - 会话上下文
 - 适用阶段：精排、重排
+- 实现考虑：
+  - 用户特征服务独立部署
+  - 会话级缓存减少查询
+  - 隐私保护和数据脱敏
+
+**特征成本分析表**：
+
+| 特征类型 | 计算成本 | 存储成本 | 更新频率 | 适用阶段 |
+|---------|---------|---------|---------|----------|
+| 静态质量分 | O(1) | 4B/doc | 每日 | 全阶段 |
+| BM25 | O(k) | 0 | 实时 | 召回/粗排 |
+| 词向量相似度 | O(d) | 4d B/doc | 离线 | 粗排 |
+| BERT 分数 | O(n²) | 0 | 实时 | 精排 |
+| 用户 CTR | O(1) | 可变 | 准实时 | 精排/重排 |
+
+其中 k=查询词数，d=向量维度，n=序列长度
+
+**特征分配原则**：
+1. **计算/存储权衡**：高频特征倾向预计算，低频特征实时计算
+2. **精度递增**：早期阶段使用粗粒度特征，后期使用细粒度特征
+3. **个性化递增**：早期通用特征，后期个性化特征
+4. **复用最大化**：设计可跨阶段复用的特征
 
 ### 24.2.2 特征缓存与复用策略
 
@@ -121,6 +288,12 @@ module FeatureCache = struct
     | TTL of Time.span
     | LRU of int
     | Adaptive of (unit -> policy)
+    
+  type cache_stats = {
+    hit_rate : float;
+    avg_latency : Time.span;
+    memory_usage : int;
+  }
 end
 ```
 
@@ -129,6 +302,70 @@ end
 - **查询级缓存**：热门查询的特征结果
 - **会话级缓存**：用户会话内的特征复用
 - **分布式缓存**：跨机器共享计算结果
+
+**多级缓存架构**：
+
+```ocaml
+module HierarchicalCache = struct
+  type level = 
+    | ProcessLocal    (* 最快，容量小 *)
+    | MachineLocal    (* 快，容量中等 *)
+    | Distributed     (* 慢，容量大 *)
+    
+  type lookup_result = 
+    | Hit of (value * level)
+    | Miss
+    
+  val lookup : key -> lookup_result
+  val populate : key -> value -> level -> unit
+end
+```
+
+**缓存策略优化**：
+
+1. **热度感知**：
+   - 统计查询频率，优先缓存高频特征
+   - 使用 Count-Min Sketch 估计频率
+   - 自适应调整不同特征的 TTL
+
+2. **预取机制**：
+   - 基于查询 pattern 预测可能需要的特征
+   - 在空闲时预热常用特征
+   - 会话开始时批量加载用户特征
+
+3. **压缩存储**：
+   - 特征量化：float32 → int8
+   - 稀疏表示：只存储非零值
+   - Delta 编码：存储与基准值的差异
+
+4. **失效策略**：
+   ```ocaml
+   module Invalidation = struct
+     type strategy = 
+       | Immediate      (* 立即失效 *)
+       | Eventual      (* 最终一致性 *)
+       | Versioned     (* 版本控制 *)
+       
+     val invalidate : cache_key -> strategy -> unit
+   end
+   ```
+
+**复用模式设计**：
+
+1. **特征继承链**：
+   ```
+   召回特征 → 粗排继承 + 扩展 → 精排继承 + 深化
+   ```
+
+2. **特征池化**：
+   - 维护全局特征池
+   - 各阶段按需提取
+   - 避免重复计算
+
+3. **增量计算**：
+   - 基于已有特征计算新特征
+   - 如：BM25 基础上计算 BM25F
+   - 向量运算的部分结果复用
 
 ### 24.2.3 跨阶段特征增强机制
 
@@ -145,6 +382,100 @@ end
 3. **特征衍生**：
    - 从粗排分数分布推导文档区分度
    - 从精排预测结果生成置信度特征
+
+**特征传递协议**：
+
+```ocaml
+module FeaturePassthrough = struct
+  type feature_bundle = {
+    stage_scores : (string * float) list;
+    raw_features : Feature.collection;
+    derived_features : Feature.collection;
+    computation_time : (string * Time.span) list;
+  }
+  
+  val encode : feature_bundle -> bytes
+  val decode : bytes -> feature_bundle
+  val merge : feature_bundle list -> feature_bundle
+end
+```
+
+**增强机制设计**：
+
+1. **统计特征增强**：
+   ```ocaml
+   module StatisticalEnhancement = struct
+     (* 基于候选集分布的特征 *)
+     type distribution_features = {
+       score_mean : float;
+       score_std : float;
+       rank_percentile : float;
+       z_score : float;
+     }
+     
+     val compute : scores:float array -> int -> distribution_features
+   end
+   ```
+
+2. **交叉特征生成**：
+   - 召回方式 × 查询类型
+   - 静态质量 × 查询相关性
+   - 时效性 × 用户偏好
+
+3. **元特征（Meta-features）**：
+   - 各阶段耗时
+   - 特征覆盖率
+   - 模型置信度
+   - 候选集大小
+
+**特征工程最佳实践**：
+
+1. **特征标准化**：
+   ```ocaml
+   module Normalization = struct
+     type method_ = 
+       | MinMax of { min: float; max: float }
+       | ZScore of { mean: float; std: float }
+       | Quantile of { percentiles: float array }
+       | Log1p  (* log(1 + x) for long-tail features *)
+   end
+   ```
+
+2. **特征选择**：
+   - 基于互信息的特征重要性
+   - 前向/后向特征选择
+   - L1 正则化自动选择
+   - 在线特征价值评估
+
+3. **特征监控**：
+   - 特征分布偏移检测
+   - 缺失率告警
+   - 计算延迟跟踪
+   - A/B 测试新特征
+
+**跨阶段协同优化**：
+
+```ocaml
+module CrossStageOptimization = struct
+  type feedback = {
+    stage : string;
+    quality_delta : float;
+    latency_delta : Time.span;
+  }
+  
+  (* 基于下游反馈调整上游策略 *)
+  val adjust_upstream : 
+    feedback list -> 
+    current_config -> 
+    optimized_config
+end
+```
+
+关键技术：
+- 反向传播梯度到早期阶段
+- 联合训练多阶段模型
+- 端到端优化目标函数
+- 知识蒸馏改进早期阶段
 
 ## 24.3 动态算力分配与延迟预算管理
 
