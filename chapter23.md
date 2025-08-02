@@ -363,17 +363,751 @@ module type MultiObjectiveRanker = sig
 end
 ```
 
-### 23.4 在线学习与 Bandit 算法
-- 23.4.1 探索与利用的权衡（Exploration vs Exploitation）
-- 23.4.2 上下文 Bandit（Contextual Bandit）架构
-- 23.4.3 实时特征更新与模型自适应
-- 23.4.4 用户反馈的增量学习
+## 23.4 在线学习与 Bandit 算法
 
-### 23.5 大规模分布式训练与模型服务化
-- 23.5.1 数据并行与模型并行策略
-- 23.5.2 特征工程的分布式管道
-- 23.5.3 模型版本管理与 A/B 测试
-- 23.5.4 低延迟推理服务架构
+传统的排序模型通常采用离线批量训练，但这种方式难以快速适应用户行为的变化。在线学习和 Bandit 算法为实时优化提供了理论框架和实践方案，使搜索引擎能够在服务用户的同时不断改进排序质量。
+
+### 23.4.1 探索与利用的权衡（Exploration vs Exploitation）
+
+在线学习的核心挑战是如何平衡探索（尝试新的排序策略）和利用（使用已知的最佳策略）。
+
+**理论基础**：
+- **遗憾界限（Regret Bound）**：衡量算法性能与最优策略的差距
+- **置信区间（Confidence Bound）**：量化不确定性的数学工具
+- **贝叶斯框架**：将不确定性建模为概率分布
+
+**经典算法对比**：
+
+| 算法 | 探索策略 | 计算复杂度 | 收敛速度 | 适用场景 |
+|------|----------|------------|----------|----------|
+| ε-greedy | 随机探索 | O(1) | 慢 | 简单场景 |
+| UCB | 置信上界 | O(log n) | 中等 | 静态环境 |
+| Thompson Sampling | 后验采样 | O(K) | 快 | 复杂环境 |
+| LinUCB | 线性模型 | O(d²) | 快 | 高维特征 |
+
+**架构设计考虑**：
+```ocaml
+module type ExplorationStrategy = sig
+  type action
+  type context
+  type reward = float
+  
+  (* 选择动作的接口 *)
+  val select_action : 
+    context:context -> 
+    available_actions:action list -> 
+    action
+    
+  (* 更新模型的接口 *)
+  val update : 
+    context:context -> 
+    action:action -> 
+    reward:reward -> 
+    unit
+    
+  (* 获取不确定性估计 *)
+  val uncertainty : 
+    context:context -> 
+    action:action -> 
+    float
+end
+```
+
+**实践中的权衡策略**：
+
+1. **时间衰减的探索率**：
+   ```
+   ε(t) = min(1, c/√t)
+   ```
+   早期多探索，后期多利用
+
+2. **基于流量的分配**：
+   - 10% 流量用于探索实验
+   - 90% 流量使用最优策略
+   - 特殊用户群体的差异化处理
+
+3. **风险控制机制**：
+   - 设置性能下限阈值
+   - 异常检测与自动回滚
+   - 分级实验框架
+
+### 23.4.2 上下文 Bandit（Contextual Bandit）架构
+
+上下文 Bandit 将用户查询、文档特征等作为上下文信息，学习在不同情境下的最优排序策略。
+
+**系统架构组件**：
+
+```ocaml
+module type ContextualBandit = sig
+  (* 上下文定义 *)
+  type context = {
+    query_features: float array;
+    user_features: float array;
+    temporal_features: float array;
+    device_features: float array;
+  }
+  
+  (* 动作空间定义 *)
+  type action = {
+    ranking_function: ranking_params;
+    feature_weights: float array;
+    algorithm_choice: algorithm_type;
+  }
+  
+  (* 策略学习接口 *)
+  val learn_policy : 
+    contexts:context list ->
+    actions:action list ->
+    rewards:reward list ->
+    policy
+    
+  (* 在线决策接口 *)
+  val make_decision :
+    context:context ->
+    policy:policy ->
+    exploration_rate:float ->
+    action
+end
+```
+
+**LinUCB 算法实现要点**：
+
+1. **特征映射**：
+   - 将上下文和动作组合成特征向量
+   - 特征交叉与非线性变换
+   - 稀疏特征的嵌入表示
+
+2. **参数更新**：
+   ```
+   A = A + x × x^T  (协方差矩阵)
+   b = b + r × x    (奖励向量)
+   θ = A^(-1) × b   (参数估计)
+   ```
+
+3. **置信区间计算**：
+   ```
+   UCB = x^T × θ + α × √(x^T × A^(-1) × x)
+   ```
+
+**分布式实现挑战**：
+- **状态同步**：多机器间的参数一致性
+- **延迟反馈**：异步更新的处理
+- **存储优化**：协方差矩阵的压缩存储
+
+### 23.4.3 实时特征更新与模型自适应
+
+在线学习系统需要实时更新特征并调整模型参数，这对架构设计提出了严格要求。
+
+**特征更新管道**：
+
+```ocaml
+module type RealtimeFeaturePipeline = sig
+  (* 特征计算接口 *)
+  type feature_extractor = {
+    extract_query_features: query -> feature_vector;
+    extract_doc_features: document -> feature_vector;
+    extract_interaction_features: (query * document) -> feature_vector;
+  }
+  
+  (* 流式更新接口 *)
+  type stream_processor = {
+    process_click_stream: click_event Stream.t -> unit;
+    update_statistics: statistics -> statistics;
+    propagate_updates: feature_cache -> unit;
+  }
+  
+  (* 特征服务接口 *)
+  val get_features : 
+    query:query -> 
+    documents:document list -> 
+    feature_matrix
+    
+  val update_cache :
+    event:user_event ->
+    cache:feature_cache ->
+    unit
+end
+```
+
+**实时计算架构**：
+
+1. **近线特征（Near-line Features）**：
+   - 分钟级更新的统计特征
+   - 使用流处理框架（Flink、Spark Streaming）
+   - 双缓冲机制避免读写冲突
+
+2. **在线特征（Online Features）**：
+   - 毫秒级更新的实时特征
+   - 内存数据结构（Redis、Aerospike）
+   - 写入放大的优化策略
+
+3. **特征版本管理**：
+   - 特征 schema 的演进
+   - 向后兼容性保证
+   - 特征重要性追踪
+
+**模型自适应机制**：
+
+```ocaml
+module type AdaptiveModel = sig
+  (* 自适应策略 *)
+  type adaptation_strategy =
+    | FixedWindow of int        (* 固定窗口 *)
+    | ExponentialDecay of float (* 指数衰减 *)
+    | AdaptiveWindow            (* 自适应窗口 *)
+  
+  (* 更新触发条件 *)
+  type update_trigger =
+    | TimeBasedTrigger of duration
+    | EventCountTrigger of int
+    | PerformanceTrigger of metric_threshold
+    
+  (* 模型更新接口 *)
+  val incremental_update :
+    model:model ->
+    new_data:training_batch ->
+    strategy:adaptation_strategy ->
+    model
+    
+  (* 概念漂移检测 *)
+  val detect_drift :
+    historical_performance:metrics list ->
+    current_performance:metrics ->
+    drift_score:float
+end
+```
+
+**性能优化技巧**：
+1. **批量更新**：累积一定量更新后批处理
+2. **异步更新**：解耦特征计算和模型服务
+3. **降级策略**：更新失败时的 fallback 方案
+
+### 23.4.4 用户反馈的增量学习
+
+用户反馈（点击、停留时间、转化）是在线学习的核心信号源。如何设计一个高效、准确的反馈收集和学习系统至关重要。
+
+**反馈信号类型**：
+
+```ocaml
+module type UserFeedback = sig
+  type implicit_signal =
+    | Click of {position: int; timestamp: float}
+    | Dwell of {duration: float; scroll_depth: float}
+    | Skip of {position: int}
+    | Return of {time_to_return: float}
+    
+  type explicit_signal =
+    | Rating of {score: int; comment: string option}
+    | Report of {issue_type: issue; description: string}
+    | Bookmark of {folder: string option}
+    
+  type contextual_info = {
+    device_type: device;
+    network_quality: network;
+    time_of_day: float;
+    user_state: user_context;
+  }
+end
+```
+
+**增量学习架构**：
+
+1. **事件收集层**：
+   - 前端埋点：点击、滚动、停留
+   - 服务端日志：查询、展示、交互
+   - 实时流处理：去重、清洗、聚合
+
+2. **信号处理层**：
+   ```ocaml
+   module type SignalProcessor = sig
+     (* 位置偏差校正 *)
+     val correct_position_bias : 
+       clicks:click list -> 
+       impressions:impression list -> 
+       corrected_ctr:float array
+       
+     (* 信号聚合 *)
+     val aggregate_signals :
+       implicit:implicit_signal list ->
+       explicit:explicit_signal list ->
+       unified_score:float
+       
+     (* 噪声过滤 *)
+     val filter_noise :
+       signals:signal list ->
+       user_history:history ->
+       filtered:signal list
+   end
+   ```
+
+3. **模型更新层**：
+   - **小批量梯度下降**：平衡实时性和稳定性
+   - **重要性采样**：处理分布偏移
+   - **正则化策略**：防止过拟合近期数据
+
+**反馈延迟处理**：
+
+```ocaml
+module type DelayedFeedback = sig
+  (* 延迟建模 *)
+  type delay_model = {
+    estimate_delay: context -> time_distribution;
+    correct_bias: observed_delays -> correction_factor;
+  }
+  
+  (* 归因窗口 *)
+  type attribution_window = {
+    click_window: duration;      (* 点击归因窗口 *)
+    conversion_window: duration;  (* 转化归因窗口 *)
+    model: attribution_model;     (* 归因模型 *)
+  }
+  
+  (* 处理延迟反馈 *)
+  val handle_delayed_feedback :
+    event:delayed_event ->
+    window:attribution_window ->
+    model:model ->
+    updated_model:model
+end
+```
+
+**实践中的挑战与解决方案**：
+
+1. **稀疏反馈问题**：
+   - 使用隐式信号补充显式反馈
+   - 多任务学习共享表示
+   - 迁移学习利用相似领域数据
+
+2. **反馈质量问题**：
+   - 异常检测过滤恶意点击
+   - 用户分群差异化处理
+   - 置信度加权的更新策略
+
+3. **实时性要求**：
+   - 分层更新：热门查询实时，长尾查询批量
+   - 近似算法：在线学习的简化版本
+   - 缓存预热：提前计算常见场景
+
+## 23.5 大规模分布式训练与模型服务化
+
+搜索排序模型通常需要处理数十亿的训练样本和数千维的特征，这对训练效率和服务性能提出了极高要求。本节探讨如何构建一个可扩展、高可用的分布式训练和服务系统。
+
+### 23.5.1 数据并行与模型并行策略
+
+大规模排序模型的训练需要合理的并行化策略来充分利用计算资源。
+
+**数据并行架构**：
+
+```ocaml
+module type DataParallelTraining = sig
+  type worker_id = int
+  type gradient = float array
+  type model_state
+  
+  (* 工作节点接口 *)
+  type worker = {
+    id: worker_id;
+    compute_gradient: batch -> model_state -> gradient;
+    apply_update: model_state -> gradient -> model_state;
+  }
+  
+  (* 参数服务器接口 *)
+  type parameter_server = {
+    aggregate_gradients: gradient list -> gradient;
+    broadcast_model: model_state -> worker_id list -> unit;
+    handle_stragglers: worker_id list -> recovery_strategy;
+  }
+  
+  (* 同步策略 *)
+  type sync_strategy =
+    | BSP         (* Bulk Synchronous Parallel *)
+    | ASP         (* Asynchronous Parallel *)
+    | SSP of int  (* Stale Synchronous Parallel *)
+end
+```
+
+**模型并行架构**：
+
+对于超大规模模型（如深度神经网络），单机内存可能无法容纳完整模型。
+
+```ocaml
+module type ModelParallelTraining = sig
+  (* 模型分片策略 *)
+  type partition_strategy =
+    | LayerWise      (* 按层切分 *)
+    | TensorSlicing  (* 张量切片 *)
+    | PipelineParallel (* 流水线并行 *)
+  
+  (* 通信模式 *)
+  type communication_pattern =
+    | AllReduce      (* 全局归约 *)
+    | PointToPoint   (* 点对点通信 *)
+    | Collective     (* 集合通信 *)
+  
+  (* 分片管理 *)
+  val partition_model : 
+    model:model -> 
+    num_partitions:int -> 
+    strategy:partition_strategy -> 
+    model_shard list
+    
+  (* 前向传播协调 *)
+  val coordinate_forward : 
+    input:tensor -> 
+    shards:model_shard list -> 
+    output:tensor
+end
+```
+
+**混合并行策略**：
+
+实践中常采用数据并行和模型并行的混合策略：
+
+1. **层内模型并行**：大型嵌入层的分片存储
+2. **层间数据并行**：不同样本在不同机器处理  
+3. **流水线并行**：将模型切分成多个阶段
+
+**通信优化技术**：
+
+```ocaml
+module type CommunicationOptimization = sig
+  (* 梯度压缩 *)
+  type compression_method =
+    | Quantization of int    (* n-bit 量化 *)
+    | Sparsification of float (* Top-k 稀疏化 *)
+    | LowRankApprox of int   (* 低秩近似 *)
+  
+  (* 通信调度 *)
+  type schedule_strategy =
+    | RingAllReduce     (* 环形拓扑 *)
+    | TreeAllReduce     (* 树形拓扑 *)
+    | HierarchicalComm  (* 层次化通信 *)
+  
+  (* 重叠计算与通信 *)
+  val overlap_comp_comm :
+    computation:unit -> unit ->
+    communication:unit -> unit ->
+    unit
+end
+```
+
+**容错机制**：
+
+1. **检查点（Checkpointing）**：
+   - 周期性保存模型状态
+   - 增量检查点减少 I/O
+   - 异步检查点避免阻塞训练
+
+2. **弹性训练（Elastic Training）**：
+   - 动态增减工作节点
+   - 自动负载均衡
+   - 故障节点的平滑剔除
+
+### 23.5.2 特征工程的分布式管道
+
+特征工程是排序系统的核心，需要处理海量数据并保证特征一致性。
+
+**特征计算框架**：
+
+```ocaml
+module type FeatureEngineering = sig
+  (* 特征定义 *)
+  type feature_spec = {
+    name: string;
+    transform: data -> float;
+    dependencies: feature_name list;
+    cache_ttl: duration option;
+  }
+  
+  (* 特征管道 *)
+  type feature_pipeline = {
+    specs: feature_spec list;
+    execution_graph: dependency_graph;
+    parallelism: int;
+  }
+  
+  (* 批量特征计算 *)
+  val compute_features :
+    pipeline:feature_pipeline ->
+    input_data:data_batch ->
+    feature_matrix
+    
+  (* 特征版本管理 *)
+  val version_features :
+    old_specs:feature_spec list ->
+    new_specs:feature_spec list ->
+    migration_plan
+end
+```
+
+**分布式特征存储**：
+
+```ocaml
+module type FeatureStore = sig
+  (* 存储后端 *)
+  type storage_backend =
+    | HDFS of hdfs_config
+    | S3 of s3_config  
+    | Cassandra of cassandra_config
+    | Redis of redis_config
+  
+  (* 特征服务接口 *)
+  val batch_write : 
+    features:feature_batch ->
+    backend:storage_backend ->
+    write_result
+    
+  val batch_read :
+    keys:key list ->
+    features:feature_name list ->
+    backend:storage_backend ->
+    feature_matrix
+    
+  (* 特征监控 *)
+  val monitor_quality :
+    features:feature_name list ->
+    metrics:quality_metric list
+end
+```
+
+**特征一致性保证**：
+
+1. **离线-在线一致性**：
+   - 统一的特征计算库
+   - 特征 Replay 测试
+   - Shadow Mode 验证
+
+2. **时间一致性**：
+   - 特征时间戳管理
+   - 时间窗口对齐
+   - 延迟数据处理
+
+**实时特征计算优化**：
+
+```ocaml
+module type RealtimeFeatures = sig
+  (* 流处理配置 *)
+  type stream_config = {
+    source: kafka_topic;
+    window: time_window;
+    watermark: watermark_strategy;
+  }
+  
+  (* 增量计算 *)
+  val incremental_aggregate :
+    current_state:state ->
+    new_events:event list ->
+    updated_state:state
+    
+  (* 近似计算 *)
+  val approximate_compute :
+    exact_algorithm:algorithm ->
+    error_bound:float ->
+    approximate_algorithm
+end
+```
+
+### 23.5.3 模型版本管理与 A/B 测试
+
+模型的迭代优化需要完善的版本管理和实验框架支持。
+
+**模型版本管理系统**：
+
+```ocaml
+module type ModelVersioning = sig
+  (* 模型元数据 *)
+  type model_metadata = {
+    version: string;
+    training_date: timestamp;
+    metrics: performance_metrics;
+    features_used: feature_list;
+    hyperparameters: param_dict;
+    lineage: training_lineage;
+  }
+  
+  (* 版本控制操作 *)
+  val register_model :
+    model:model ->
+    metadata:model_metadata ->
+    model_id
+    
+  val rollback_model :
+    current_version:string ->
+    target_version:string ->
+    rollback_result
+    
+  (* 模型比较 *)
+  val diff_models :
+    version1:string ->
+    version2:string ->
+    model_diff
+end
+```
+
+**A/B 测试框架**：
+
+```ocaml
+module type ABTestFramework = sig
+  (* 实验配置 *)
+  type experiment = {
+    name: string;
+    variants: variant list;
+    traffic_allocation: allocation;
+    success_metrics: metric list;
+    guardrail_metrics: metric list;
+    duration: experiment_duration;
+  }
+  
+  (* 流量分配 *)
+  type allocation_strategy =
+    | Random of percentage list
+    | Stratified of user_segment list
+    | Progressive of ramp_up_schedule
+  
+  (* 实验执行 *)
+  val assign_variant :
+    user:user_id ->
+    experiment:experiment ->
+    variant
+    
+  (* 结果分析 *)
+  val analyze_results :
+    experiment:experiment ->
+    data:experiment_data ->
+    statistical_report
+end
+```
+
+**实验设计最佳实践**：
+
+1. **统计功效分析**：
+   - 样本量计算
+   - 效应量估计
+   - 多重检验校正
+
+2. **实验隔离**：
+   - 用户分桶哈希
+   - 实验间互斥
+   - 溢出效应控制
+
+3. **渐进式发布**：
+   ```ocaml
+   type rollout_strategy = {
+     initial_percentage: float;
+     increment: float;
+     evaluation_period: duration;
+     rollback_threshold: metric_threshold;
+     final_percentage: float;
+   }
+   ```
+
+### 23.5.4 低延迟推理服务架构
+
+搜索排序需要在毫秒级完成推理，这对服务架构提出了严格要求。
+
+**模型服务架构**：
+
+```ocaml
+module type ModelServing = sig
+  (* 服务配置 *)
+  type serving_config = {
+    model_path: string;
+    batch_size: int;
+    timeout_ms: int;
+    num_threads: int;
+    gpu_config: gpu_config option;
+  }
+  
+  (* 推理接口 *)
+  val predict :
+    input:feature_batch ->
+    config:serving_config ->
+    prediction_batch
+    
+  (* 性能优化 *)
+  type optimization =
+    | Quantization of precision
+    | Pruning of sparsity
+    | Distillation of teacher_model
+    | Compilation of target_hardware
+end
+```
+
+**延迟优化技术**：
+
+1. **模型优化**：
+   - INT8 量化：精度损失 <1%，速度提升 2-4x
+   - 知识蒸馏：小模型逼近大模型性能
+   - 剪枝：移除冗余连接
+
+2. **服务优化**：
+   ```ocaml
+   module type ServingOptimization = sig
+     (* 批处理策略 *)
+     type batching_strategy = {
+       max_batch_size: int;
+       max_latency_ms: int;
+       padding_strategy: padding;
+     }
+     
+     (* 缓存策略 *)
+     type cache_config = {
+       feature_cache: lru_cache;
+       embedding_cache: embedding_cache;
+       result_cache: ttl_cache;
+     }
+     
+     (* 负载均衡 *)
+     type load_balancer =
+       | RoundRobin
+       | LeastConnection  
+       | LatencyAware
+       | ConsistentHash
+   end
+   ```
+
+3. **硬件加速**：
+   - GPU 推理：批量矩阵运算
+   - TPU/NPU：专用推理芯片
+   - FPGA：定制化加速
+
+**多模型服务编排**：
+
+```ocaml
+module type ModelOrchestration = sig
+  (* 级联模型 *)
+  type cascade_config = {
+    stages: model_stage list;
+    early_exit_threshold: float list;
+    fallback_strategy: fallback;
+  }
+  
+  (* 集成策略 *)
+  type ensemble_method =
+    | Voting of weight list
+    | Stacking of meta_model
+    | Blending of blend_function
+  
+  (* 动态路由 *)
+  val route_request :
+    request:inference_request ->
+    available_models:model list ->
+    selected_model
+end
+```
+
+**监控与降级**：
+
+1. **服务监控指标**：
+   - P50/P95/P99 延迟
+   - QPS 和吞吐量
+   - 错误率和超时率
+   - 资源利用率
+
+2. **自动降级机制**：
+   - 延迟超标时切换轻量模型
+   - 错误率高时回退到规则
+   - 流量突增时的限流保护
 
 ### 23.6 架构设计模式与实践
 - 23.6.1 特征存储与实时计算
